@@ -1,0 +1,1368 @@
+# Управление пользователями, группами и привилегиями в Linux
+> Углублённая лекция · DevOps Middle+
+
+---
+
+## Содержание
+
+1. [Как Linux идентифицирует пользователей — UID и GID](#1-uid-и-gid)
+2. [/etc/passwd — что хранится и почему именно там](#2-etcpasswd)
+3. [/etc/shadow — почему пароли вынесены отдельно](#3-etcshadow)
+4. [/etc/group — группы и зачем они нужны](#4-etcgroup)
+5. [NSS — откуда система берёт данные о пользователях](#5-nss)
+6. [SSSD, LDAP, Active Directory — централизованное управление](#6-sssd-ldap-active-directory)
+7. [Типы пользователей — системные, сервисные, обычные](#7-типы-пользователей)
+8. [Управление пользователями и группами](#8-управление-пользователями-и-группами)
+9. [sudo — механизм повышения привилегий](#9-sudo)
+10. [su и su- — переключение пользователей](#10-su)
+11. [Анти-паттерны](#11-анти-паттерны)
+12. [Реальные кейсы с дебагом](#12-реальные-кейсы-с-дебагом)
+13. [Вопросы на собесе](#13-вопросы-на-собесе)
+14. [Шпаргалка](#14-шпаргалка)
+
+---
+
+## 1. UID и GID
+
+### Как Linux на самом деле видит пользователей
+
+Важно понять сразу: Linux **не знает имён**. Внутри ядра не существует понятия «пользователь nginx» или «пользователь root». Ядро оперирует только числами.
+
+**UID (User ID)** — целое число, которым ядро идентифицирует владельца процесса или файла.
+**GID (Group ID)** — целое число, идентифицирующее группу.
+
+Имена (`root`, `nginx`, `www-data`) — это просто удобные псевдонимы. Они существуют в файлах `/etc/passwd` и `/etc/group`. Ядро при каждой проверке прав берёт число, а не строку.
+
+```bash
+# посмотреть свой UID и GID
+id
+# uid=1000(fa1ry) gid=1000(fa1ry) groups=1000(fa1ry),27(sudo),1001(developers)
+
+# посмотреть конкретного пользователя
+id nginx
+# uid=33(www-data) gid=33(www-data) groups=33(www-data)
+
+# UID и GID процесса — то что реально видит ядро
+cat /proc/$(pgrep -o nginx)/status | grep -E "^(Uid|Gid)"
+# Uid: 33  33  33  33
+# Gid: 33  33  33  33
+# ← четыре числа: real, effective, saved, filesystem
+```
+
+### Real, Effective, Saved UID — три вида UID процесса
+
+У каждого процесса не один UID, а три. Это фундаментальный механизм ядра который лежит в основе sudo, SUID и любого повышения привилегий:
+
+| | Название | Смысл |
+|-|---------|-------|
+| **RUID** | Real UID | Кто реально запустил процесс. Не меняется на протяжении жизни процесса (кроме явного вызова `setuid()` от root). |
+| **EUID** | Effective UID | От чьего имени ядро проверяет права прямо сейчас. Именно это число ядро смотрит при каждом системном вызове: `open()`, `read()`, `kill()`, `bind()`. Обычно равен RUID, но меняется при SUID и sudo. |
+| **SUID** | Saved UID | Сохранённая копия EUID до его изменения. Нужна чтобы процесс мог временно сбросить привилегии (понизить EUID до RUID) и потом вернуть их обратно без участия ядра. |
+
+**Пример с sudo — как меняются UID:**
+
+```
+Вы (UID=1000) запускаете: sudo nginx -t
+
+         RUID   EUID   SUID
+bash     1000   1000   1000   ← обычный процесс
+  │
+  └── fork() → новый bash-процесс
+                1000   1000   1000
+  └── execve("/usr/bin/sudo", ...)
+              → sudo процесс
+                1000    0     1000
+                ────   ─── 
+                вы    root   ← EUID=0 благодаря SUID биту на /usr/bin/sudo
+                             ← RUID=1000 — ядро помнит кто реально запустил
+                             ← SUID=1000 — сохранён на случай отката
+```
+
+**Почему важен SUID (Saved UID) — практический пример:**
+
+Некоторые программы намеренно работают с переключением привилегий. Например `ping` исторически требовал root для создания RAW сокета, но не хотел оставаться с правами root всё время выполнения:
+
+```
+ping запускается:  RUID=1000, EUID=0 (SUID бит), SUID=0
+ping открывает raw socket (нужен EUID=0)  ← используем привилегии
+ping сбрасывает EUID до RUID:             EUID=1000
+ping обрабатывает ответы (не нужен root)  ← работаем без привилегий
+```
+
+Без Saved UID — однажды сбросив EUID до 1000, процесс не смог бы вернуть 0. Saved UID хранит «право на возврат».
+
+```bash
+# посмотреть все три UID процесса
+cat /proc/$(pgrep -o sudo)/status | grep "^Uid:"
+# Uid: 1000  0  1000  1000
+#      ────  ─  ────  ────
+#      RUID  EUID SUID fsUID
+#            ↑
+#            именно это число ядро проверяет при каждом open(), read(), kill()
+
+# для своей текущей сессии
+cat /proc/self/status | grep "^Uid:"
+```
+
+Именно `Effective UID` проверяет ядро когда решает — можно ли открыть файл, создать сокет, убить процесс.
+
+---
+
+## 2. /etc/passwd
+
+### Структура файла
+
+`/etc/passwd` — это база данных пользователей системы. Каждая строка — один пользователь, семь полей разделённых двоеточием:
+
+```
+имя : пароль : UID : GID : GECOS : домашняя_директория : оболочка
+ 1       2      3    4      5            6                    7
+```
+
+```bash
+cat /etc/passwd | head -5
+# root:x:0:0:root:/root:/bin/bash
+# daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+# www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+# nginx:x:105:110:nginx user,,,:/var/cache/nginx:/usr/sbin/nologin
+# fa1ry:x:1000:1000:fa1ry,,,:/home/fa1ry:/bin/bash
+```
+
+Разбор каждого поля:
+
+| Поле | Пример | Описание |
+|------|--------|----------|
+| Имя | `fa1ry` | Логин пользователя |
+| Пароль | `x` | `x` — пароль в `/etc/shadow`. `*` или `!` — вход по паролю заблокирован |
+| UID | `1000` | Числовой идентификатор |
+| GID | `1000` | Числовой идентификатор основной группы |
+| GECOS | `fa1ry,,,` | Комментарий — полное имя, телефон. Исторический артефакт, обычно пустой |
+| Домашняя директория | `/home/fa1ry` | Куда попадает пользователь при логине, значение `$HOME` |
+| Оболочка | `/bin/bash` | Программа запускаемая при логине. `/usr/sbin/nologin` — вход запрещён |
+
+```bash
+# посмотреть конкретного пользователя
+grep "^nginx:" /etc/passwd
+# nginx:x:105:110::/var/cache/nginx:/usr/sbin/nologin
+
+# что значит /usr/sbin/nologin
+su - nginx
+# This account is currently not available.
+# ← nologin выводит это сообщение и завершается с кодом ошибки
+```
+
+### Почему /etc/passwd читаем всеми
+
+Файл доступен на чтение всем — это намеренно. Многие программы используют его для перевода UID в имя при выводе (`ls -la` показывает имена, а не числа). Пароли здесь не хранятся — поэтому нет угрозы.
+
+```bash
+ls -la /etc/passwd
+# -rw-r--r-- 1 root root 2847 /etc/passwd
+#    ^^^
+#    читают все — это нормально и намеренно
+```
+
+---
+
+## 3. /etc/shadow
+
+### Зачем вынесли пароли
+
+Исторически хэши паролей хранились прямо в `/etc/passwd`. Поскольку файл читаем всеми — любой пользователь мог забрать хэши и взломать их офлайн. Поэтому хэши вынесли в `/etc/shadow` — файл читаемый только root и группой shadow.
+
+```bash
+ls -la /etc/shadow
+# -rw-r----- 1 root shadow 1340 /etc/shadow
+#    ^^
+#    только root и группа shadow
+
+sudo cat /etc/shadow | grep fa1ry
+# fa1ry:$6$rounds=500000$salt$hashed....:19800:0:99999:7:::
+```
+
+### Структура строки shadow
+
+Девять полей разделённых двоеточием:
+
+```
+имя : хэш : последнее_изм. : мин_дни : макс_дни : предупрежд. : неактивн. : истечение : резерв
+ 1     2           3              4          5           6             7            8         9
+```
+
+| Поле | Пример | Описание |
+|------|--------|----------|
+| Имя | `fa1ry` | Логин |
+| Хэш | `$6$salt$hash` | Хэш пароля. `!` или `*` = аккаунт заблокирован |
+| Последнее изменение | `19800` | Дней с 01.01.1970 когда менялся пароль |
+| Мин. дни | `0` | Минимум дней до следующей смены (0 = можно менять сразу) |
+| Макс. дни | `99999` | Через сколько дней пароль устаревает (99999 ≈ никогда) |
+| Предупреждение | `7` | За сколько дней до истечения предупреждать |
+| Неактивность | пусто | Дней после истечения до блокировки аккаунта |
+| Истечение | пусто | Абсолютная дата блокировки аккаунта |
+
+### Формат хэша
+
+```
+$6$rounds=500000$randomsalt$actualhashvalue
+│  │             │           │
+│  │             │           └── сам хэш пароля
+│  │             └── соль (случайные байты, уникальны для каждого пароля)
+│  └── параметры алгоритма
+└── алгоритм: $1$=MD5(устарел), $5$=SHA-256, $6$=SHA-512, $y$=yescrypt(современный)
+```
+
+**Соль** нужна чтобы два пользователя с одинаковым паролем имели разные хэши — нельзя заранее посчитать таблицу соответствий (rainbow table).
+
+```bash
+# управление паролями и сроком действия
+sudo chage -l fa1ry             # посмотреть политику паролей пользователя
+sudo chage -M 90 fa1ry          # пароль устаревает через 90 дней
+sudo chage -E 2025-12-31 fa1ry  # заблокировать аккаунт после даты
+
+# заблокировать аккаунт (ставит ! перед хэшем в shadow)
+sudo passwd -l fa1ry
+# разблокировать
+sudo passwd -u fa1ry
+
+# проверить статус аккаунта
+sudo passwd -S fa1ry
+# fa1ry P 2024-01-15 0 99999 7 -1
+# P = Password (активен), L = Locked, NP = No Password
+```
+
+---
+
+## 4. /etc/group
+
+### Зачем нужны группы
+
+Группы решают задачу «дать права сразу нескольким пользователям на ресурс». Вместо того чтобы настраивать права для каждого пользователя отдельно — создаёте группу, добавляете пользователей, даёте права группе.
+
+```bash
+cat /etc/group | grep -E "sudo|developers|www-data"
+# sudo:x:27:fa1ry,deploy
+# www-data:x:33:nginx,deploy
+# developers:x:1001:fa1ry,alice,bob
+```
+
+Структура строки — четыре поля:
+
+```
+имя_группы : пароль : GID : список_пользователей
+     1           2      3          4
+```
+
+Поле пароля — почти всегда `x` или пустое. Групповые пароли — устаревший механизм, не используется.
+
+### Основная группа vs дополнительные группы
+
+У каждого пользователя есть:
+- **Основная группа (primary group)** — записана в `/etc/passwd`, используется по умолчанию при создании файлов
+- **Дополнительные группы (supplementary groups)** — перечислены в `/etc/group`, дают дополнительные права доступа
+
+```bash
+id fa1ry
+# uid=1000(fa1ry) gid=1000(fa1ry) groups=1000(fa1ry),27(sudo),33(www-data),1001(developers)
+#                 ────────────────
+#                 основная группа   ← используется при создании новых файлов
+
+# когда fa1ry создаёт файл — он принадлежит основной группе fa1ry, не developers
+touch testfile
+ls -la testfile
+# -rw-r--r-- 1 fa1ry fa1ry   ← группа fa1ry
+
+# чтобы создать файл с группой developers — переключить активную группу
+newgrp developers
+touch project_file
+ls -la project_file
+# -rw-r--r-- 1 fa1ry developers   ← теперь developers
+```
+
+---
+
+## 5. NSS
+
+### /etc/nsswitch.conf — откуда система берёт данные о пользователях
+
+Большинство думают что `/etc/passwd` — единственный источник данных о пользователях. Это не так. Linux использует слой абстракции **NSS (Name Service Switch)** который определяет порядок и источники поиска для разных типов данных.
+
+**NSS (Name Service Switch)** — это механизм ядра и libc, который говорит системе: «когда тебе нужно найти пользователя по имени или UID — вот список источников и в каком порядке их опрашивать».
+
+```bash
+cat /etc/nsswitch.conf
+```
+
+```
+passwd:   files sssd
+group:    files sssd
+shadow:   files sssd
+hosts:    files dns
+networks: files
+```
+
+Разбор строки `passwd: files sssd`:
+
+```
+passwd: files  sssd
+         │      │
+         │      └── если не нашли в files — идём в SSSD
+         │           (который может связываться с LDAP, AD, FreeIPA)
+         └── сначала смотреть в /etc/passwd
+```
+
+### Источники NSS и их смысл
+
+| Источник | Что это |
+|---------|---------|
+| `files` | Локальные файлы: `/etc/passwd`, `/etc/group`, `/etc/shadow` |
+| `dns` | DNS сервер (для hosts, networks) |
+| `sssd` | SSSD daemon — кэш и посредник к LDAP/AD/FreeIPA |
+| `ldap` | Прямое обращение к LDAP (устарело, лучше через sssd) |
+| `nis` | NIS/YP — очень старый протокол, почти не используется |
+| `systemd` | Динамические пользователи создаваемые systemd |
+
+### Как это влияет на повседневную работу
+
+```bash
+# getent — правильная команда для запроса через NSS
+# в отличие от grep /etc/passwd — она опросит ВСЕ источники
+
+getent passwd alice          # найти пользователя (файлы + SSSD/LDAP)
+getent passwd 1000           # найти по UID
+getent group developers      # найти группу
+getent hosts myserver        # найти хост (файлы + DNS)
+
+# пример: alice есть в AD но не в /etc/passwd
+grep alice /etc/passwd       # ← пусто
+getent passwd alice          # ← alice:x:10042:10042:Alice Dev:/home/alice:/bin/bash
+#                              ← нашли через SSSD из Active Directory!
+```
+
+> ⚠️ **Частая ошибка:** скрипт использует `grep /etc/passwd` для проверки существования пользователя. На серверах с SSSD/LDAP это не работает — пользователи из AD там не видны. Правильно: `getent passwd username`.
+
+---
+
+## 6. SSSD, LDAP, Active Directory
+
+### Проблема без централизации
+
+В небольшой компании можно создавать пользователей на каждом сервере вручную. При 10 серверах и 10 сотрудниках это уже 100 операций. При 1000 серверов — это невозможно. Нужен единый источник правды.
+
+```
+Без централизации:                  С централизацией (SSSD + AD):
+────────────────────────            ────────────────────────────────
+server1: useradd alice              Создать alice один раз в AD
+server2: useradd alice
+server3: useradd alice              Все серверы автоматически видят alice
+...                                 через SSSD → Linux хост запрашивает AD
+server1000: useradd alice
+                                    Уволился bob → удалить из AD один раз
+Уволился bob?                       → bob не может войти ни на один сервер
+→ userdel bob на каждом сервере
+```
+
+### SSSD — что это и зачем
+
+**SSSD (System Security Services Daemon)** — демон который выступает посредником между Linux хостом и централизованными хранилищами учётных записей: Active Directory, LDAP, FreeIPA. Он кэширует данные пользователей и групп локально — пользователь может войти даже если AD временно недоступен.
+
+```
+Linux хост
+  │
+  ├── PAM        ─────────────────────┐
+  └── NSS (passwd: files sssd)        │
+              │                       │
+              ▼                       ▼
+           SSSD daemon  ←──── /var/lib/sss/db/ (локальный кэш)
+              │
+              ├── LDAP provider   →  OpenLDAP / FreeIPA
+              ├── AD provider     →  Active Directory
+              └── Kerberos        →  аутентификация через Kerberos тикеты
+```
+
+### Что нужно знать DevOps Middle
+
+Вы не обязаны уметь настраивать SSSD с нуля, но должны понимать архитектуру и уметь диагностировать базовые проблемы:
+
+```bash
+# установлен ли SSSD
+systemctl status sssd
+
+# конфиг
+cat /etc/sssd/sssd.conf
+# [sssd]
+# domains = company.com
+# services = nss, pam
+#
+# [domain/company.com]
+# id_provider = ad
+# auth_provider = ad
+# ad_domain = company.com
+# ad_server = dc01.company.com
+
+# работает ли — найти пользователя из AD
+getent passwd alice@company.com
+
+# очистить кэш SSSD (при проблемах со старыми данными)
+sudo sss_cache -E
+
+# посмотреть логи SSSD
+journalctl -u sssd -f
+tail -f /var/log/sssd/sssd_company.com.log
+
+# проверить Kerberos билет (для AD аутентификации)
+klist
+```
+
+### FreeIPA — Linux-native альтернатива AD
+
+**FreeIPA** — opensource решение от Red Hat. Объединяет LDAP (389-ds), Kerberos, DNS, sudo политики и PKI в одном продукте. Стандартный выбор для Linux-ориентированных инфраструктур.
+
+```bash
+# на клиенте — присоединиться к домену FreeIPA
+ipa-client-install --domain=ipa.company.com --server=ipa01.company.com
+
+# проверить членство
+id alice
+# uid=10042(alice) gid=10042(alice) groups=10042(alice),10100(developers)
+# ← пользователь из FreeIPA, не из /etc/passwd
+```
+
+---
+
+## 7. Типы пользователей
+
+В Linux три категории пользователей с разными диапазонами UID:
+
+```
+UID 0           — root. Единственный привилегированный пользователь.
+                  Ядро проверяет euid=0 для большинства системных операций.
+
+UID 1–999       — системные пользователи (на Debian/Ubuntu).
+                  Создаются при установке пакетов для запуска сервисов.
+                  Обычно без домашней директории и без оболочки входа.
+
+UID 1000+       — обычные пользователи.
+                  Люди которые логинятся в систему.
+```
+
+> На RHEL/CentOS граница другая: системные 1–499, обычные 500+.
+> Посмотреть границы на своей системе:
+> ```bash
+> grep -E "^(UID_MIN|UID_MAX|SYS_UID_MIN|SYS_UID_MAX)" /etc/login.defs
+> ```
+
+### Сервисные пользователи — зачем и как правильно
+
+**Сервисный пользователь** — системный пользователь без возможности входа, созданный специально для запуска одного сервиса. Реализует принцип наименьших привилегий: если взломают nginx, атакующий получит права `www-data` — не root.
+
+Признаки правильного сервисного пользователя:
+- Оболочка `/usr/sbin/nologin` — нельзя залогиниться
+- Нет пароля или пароль заблокирован
+- Домашняя директория — рабочая директория сервиса, не `/home`
+- Минимум групп — только необходимые
+
+```bash
+# посмотреть сервисных пользователей
+grep "nologin\|false" /etc/passwd | head -5
+# daemon:x:1:1::/usr/sbin:/usr/sbin/nologin
+# www-data:x:33:33::/var/www:/usr/sbin/nologin
+# nginx:x:105:110::/var/cache/nginx:/usr/sbin/nologin
+
+# создать правильного сервисного пользователя для своего приложения
+sudo useradd \
+  --system \                        # системный (UID < 1000)
+  --no-create-home \                # не создавать /home/myapp
+  --home-dir /opt/myapp \           # рабочая директория
+  --shell /usr/sbin/nologin \       # запретить вход
+  --comment "My Application" \
+  myapp
+
+# проверить результат
+id myapp
+# uid=998(myapp) gid=998(myapp) groups=998(myapp)
+
+grep myapp /etc/passwd
+# myapp:x:998:998:My Application:/opt/myapp:/usr/sbin/nologin
+```
+
+### Пользователь nobody
+
+`nobody` — специальный пользователь с минимальными правами (обычно UID 65534). Исторически использовался для NFS и процессов которым вообще не нужны никакие права. Для современных сервисов лучше создавать отдельного пользователя — несколько сервисов от `nobody` могут влиять на файлы друг друга.
+
+---
+
+## 8. Управление пользователями и группами
+
+### useradd vs adduser
+
+Это разные инструменты — важно понимать разницу:
+
+**`useradd`** — низкоуровневая системная команда. Делает только то что сказано явно, без лишних вопросов. Доступна на всех Linux дистрибутивах. Подходит для скриптов и автоматизации.
+
+**`adduser`** — скрипт-обёртка над `useradd` (только Debian/Ubuntu). Интерактивный, задаёт вопросы, автоматически создаёт домашнюю директорию, копирует `/etc/skel`, сразу предлагает установить пароль.
+
+```bash
+# adduser — интерактивно, удобно для ручного создания
+sudo adduser alice
+# Adding user 'alice' ...
+# Enter new UNIX password: ...
+
+# useradd — явно, для скриптов и автоматизации
+sudo useradd \
+  --create-home \
+  --shell /bin/bash \
+  --groups sudo,developers \
+  --comment "Alice Developer" \
+  alice
+sudo passwd alice    # пароль задаётся отдельно
+```
+
+### /etc/skel — шаблон домашней директории
+
+**`/etc/skel`** (skeleton — скелет) — директория-шаблон. При создании пользователя с домашней директорией её содержимое **копируется** в новый `/home/username`:
+
+```bash
+ls -la /etc/skel/
+# .bash_logout
+# .bashrc
+# .profile
+
+# добавить файл который получат все новые пользователи
+sudo cp /etc/company/welcome.txt /etc/skel/
+sudo echo 'export EDITOR=vim' >> /etc/skel/.bashrc
+```
+
+### Основные команды управления
+
+```bash
+# ── Пользователи ─────────────────────────────────────────────────
+# Создать обычного пользователя
+useradd -m -s /bin/bash -G sudo alice
+
+# Изменить
+usermod -aG developers alice    # добавить в группу (-a = append!)
+usermod -s /bin/bash alice      # сменить оболочку
+usermod -L alice                # заблокировать (Lock)
+usermod -U alice                # разблокировать (Unlock)
+usermod -e 2025-12-31 alice     # дата истечения аккаунта
+
+# Удалить
+userdel alice                   # удалить (домашняя директория остаётся)
+userdel -r alice                # удалить вместе с домашней директорией
+
+# ── Группы ───────────────────────────────────────────────────────
+groupadd developers             # создать группу
+groupmod -n devteam developers  # переименовать группу
+groupdel developers             # удалить (нельзя если это основная группа кого-то)
+
+# ── Проверка ─────────────────────────────────────────────────────
+id alice                        # UID, GID, все группы
+groups alice                    # только имена групп
+getent passwd alice             # запись из базы (работает и с LDAP/AD)
+getent group developers         # запись группы
+```
+
+> ⚠️ `usermod -G developers alice` **заменяет** все дополнительные группы пользователя на одну `developers`. Пользователь потеряет `sudo`, `docker` и всё остальное. Всегда: `usermod -aG` (append + Group).
+
+---
+
+## 9. sudo — механизм повышения привилегий
+
+### Что такое sudo и как оно работает изнутри
+
+**sudo (substitute user do)** — программа которая позволяет пользователю выполнить команду от имени другого пользователя (обычно root) при наличии разрешения в конфигурации.
+
+Изнутри это работает через механизм **SUID**. Файл `/usr/bin/sudo` имеет установленный SUID бит:
+
+```bash
+ls -la /usr/bin/sudo
+# -rwsr-xr-x 1 root root 232416 /usr/bin/sudo
+#    ^
+#    s = SUID: при запуске euid становится равным UID владельца файла = 0 (root)
+```
+
+Пошагово что происходит когда вы пишете `sudo systemctl restart nginx`:
+
+```
+Вы (UID=1000) запускаете sudo
+        │
+        ▼
+/usr/bin/sudo запускается с euid=0 (SUID даёт root права)
+        │
+        ├─ 1. Читает /etc/sudoers — есть ли разрешение для UID=1000?
+        ├─ 2. Запрашивает ВАШ пароль (не root) через PAM
+        │     PAM (Pluggable Authentication Modules) — подсистема Linux
+        │     для аутентификации. Проверяет пароль, логирует попытку.
+        ├─ 3. Проверяет кэш: вводили ли пароль недавно (15 мин по умолчанию)?
+        │
+        ▼
+systemctl restart nginx запускается с UID=0 (root)
+```
+
+**Почему не нужен пароль root:** вы доказываете что вы это вы (ваш пароль), а sudo проверяет по конфигу что именно вам разрешено делать.
+
+### PAM — как sudo проверяет пароль
+
+sudo не проверяет пароль самостоятельно. Он делегирует всю аутентификацию системе **PAM (Pluggable Authentication Modules)**.
+
+**PAM** — это архитектура подключаемых модулей аутентификации в Linux. Идея: отделить «кто и что хочет сделать» от «как проверить что это именно он». sudo говорит PAM: «нужно аутентифицировать пользователя» — а PAM уже решает как именно, используя цепочку модулей.
+
+```bash
+cat /etc/pam.d/sudo
+# @include common-auth         ← общие правила аутентификации
+# @include common-account      ← проверка аккаунта (не заблокирован ли)
+# @include common-session-noninteractive
+```
+
+PAM строит обработку из четырёх типов цепочек:
+
+| Тип | Когда используется | Примеры модулей |
+|-----|-------------------|-----------------|
+| `auth` | Проверить что пользователь — это тот кто он есть | `pam_unix` (пароль), `pam_google_authenticator` (2FA), `pam_fprintd` (отпечаток) |
+| `account` | Проверить что аккаунт может выполнять операцию | `pam_unix` (не истёк ли аккаунт), `pam_time` (допустимое время) |
+| `password` | Изменить аутентификационные данные | `pam_unix` (смена пароля), требования к сложности |
+| `session` | Настроить и завершить сессию | `pam_limits` (применить ulimits), `pam_env` (переменные окружения) |
+
+Каждая строка в PAM файле имеет управляющий флаг:
+
+```
+тип      флаг        модуль
+─────    ────────    ─────────────────────────────
+auth     required    pam_unix.so    ← должен пройти, продолжаем цепочку
+auth     requisite   pam_unix.so    ← не прошёл — немедленно отказать
+auth     sufficient  pam_unix.so    ← прошёл — достаточно, не продолжать
+auth     optional    pam_unix.so    ← результат не влияет на итог
+```
+
+**Практическое применение — добавить 2FA к sudo:**
+
+```bash
+# установить Google Authenticator PAM модуль
+apt install libpam-google-authenticator
+
+# настроить для пользователя
+google-authenticator   # создаст ~/.google_authenticator с QR кодом
+
+# добавить в /etc/pam.d/sudo
+sudo nano /etc/pam.d/sudo
+# добавить строку ПЕРЕД @include common-auth:
+# auth required pam_google_authenticator.so
+
+# теперь sudo будет спрашивать пароль + OTP код
+sudo systemctl restart nginx
+# [sudo] password for alice:
+# Verification code:   ← Google Authenticator
+```
+
+```bash
+# посмотреть все PAM конфиги
+ls /etc/pam.d/
+# common-auth  common-account  sudo  sshd  login  su  ...
+
+# sudo использует common-auth который обычно выглядит так:
+cat /etc/pam.d/common-auth
+# auth  [success=1 default=ignore]  pam_unix.so nullok
+# auth  requisite                   pam_deny.so
+# auth  required                    pam_permit.so
+```
+
+### /etc/sudoers — синтаксис и логика
+
+`/etc/sudoers` — главный конфиг sudo. **Только через `visudo`** — он блокирует файл от параллельного редактирования и проверяет синтаксис перед сохранением. Синтаксическая ошибка в sudoers заблокирует sudo на всей системе.
+
+```bash
+sudo visudo    # открыть с проверкой синтаксиса
+```
+
+Формат каждой строки:
+
+```
+кто    откуда=(от_кого:группа)   [NOPASSWD:]  команды
+ │       │          │                │            │
+ │       │          │                │            └── полные пути через запятую
+ │       │          │                └── опционально: не спрашивать пароль
+ │       │          └── от чьего имени запускать (ALL = любой, обычно root)
+ │       └── с какого хоста (ALL = отовсюду)
+ └── пользователь или %группа
+```
+
+```bash
+# примеры записей в sudoers:
+
+# полный root доступ (небезопасно — только для доверенных администраторов)
+alice   ALL=(ALL:ALL)  ALL
+
+# группа sudo — полный доступ с паролем (дефолт Debian/Ubuntu)
+%sudo   ALL=(ALL:ALL)  ALL
+
+# deploy: только перезапуск одного сервиса, без пароля
+deploy  ALL=(root)  NOPASSWD: /usr/bin/systemctl restart myapp, \
+                               /usr/bin/systemctl stop myapp, \
+                               /usr/bin/systemctl start myapp
+
+# разработчики: только смотреть логи
+%developers  ALL=(root)  NOPASSWD: /usr/bin/journalctl, \
+                                    /usr/bin/tail /var/log/myapp/*
+
+# запретить конкретную команду (! = отрицание)
+alice  ALL=(ALL)  ALL, !/bin/su, !/usr/bin/passwd root
+```
+
+### /etc/sudoers.d/ — правильный способ добавлять правила
+
+Вместо правки основного `/etc/sudoers` — создавайте отдельные файлы. Это удобнее и безопаснее: при ошибке в одном файле остальные работают.
+
+```bash
+# создать правило для сервисного пользователя
+sudo visudo -f /etc/sudoers.d/deploy
+
+# проверить синтаксис отдельного файла
+sudo visudo -c -f /etc/sudoers.d/deploy
+# /etc/sudoers.d/deploy: parsed OK
+
+# посмотреть все файлы
+ls -la /etc/sudoers.d/
+```
+
+> ⚠️ Файлы в `/etc/sudoers.d/` не должны содержать точку в имени — иначе игнорируются. Правильно: `deploy`, `developers`, `ci-runner`. Неправильно: `deploy.conf`, `01.rules`.
+
+### sudo — полезные флаги
+
+```bash
+sudo command            # выполнить от root
+sudo -u alice command   # выполнить от имени alice
+sudo -i                 # интерактивная root сессия (login shell — загружает профиль root)
+sudo -s                 # root shell без login (без ~/.profile root)
+sudo -l                 # показать что разрешено текущему пользователю
+sudo -l -U alice        # показать что разрешено alice (нужен root)
+sudo -k                 # сбросить кэш пароля (попросит при следующем вызове)
+sudo -E command         # сохранить текущее окружение (см. ниже)
+```
+
+### Переменные окружения в sudo — частый источник проблем
+
+Это «больное» место многих инженеров. sudo намеренно очищает окружение при запуске команды. Понимание почему и как это обойти — обязательно для Middle.
+
+**`Defaults env_reset` — почему sudo «забывает» ваши переменные**
+
+По умолчанию в sudoers активна директива `env_reset`. Она означает: перед запуском команды sudo сбрасывает окружение до минимального безопасного набора и строит его заново с нуля.
+
+```bash
+# посмотреть текущие Defaults настройки
+sudo grep "^Defaults" /etc/sudoers
+
+# типичный дефолт:
+# Defaults  env_reset
+# Defaults  mail_badpass
+# Defaults  secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+```
+
+Зачем это нужно: безопасность. Переменные окружения могут влиять на поведение программ опасным образом. Например `LD_PRELOAD` позволяет подгрузить произвольную библиотеку в процесс — если бы sudo наследовал его, любой пользователь мог бы внедрить код в команду запускаемую от root.
+
+```bash
+# демонстрация
+export MYVAR=hello
+sudo bash -c 'echo $MYVAR'
+#              ← пусто! env_reset сбросил переменную
+```
+
+**`Defaults secure_path` — почему под sudo «не видна» команда**
+
+`secure_path` задаёт PATH который sudo использует для поиска команд — он полностью заменяет ваш PATH:
+
+```bash
+# ваш PATH в терминале
+echo $PATH
+# /home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/myapp/bin
+
+# PATH под sudo (из secure_path)
+sudo env | grep PATH
+# PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+#                                                              ↑ /opt/myapp/bin нет!
+
+# поэтому
+myapp --version           # работает (ваш PATH)
+sudo myapp --version      # command not found (secure_path не содержит /opt/myapp/bin)
+sudo /opt/myapp/myapp --version  # работает (полный путь)
+```
+
+Решения:
+
+```bash
+# Вариант 1: добавить путь в secure_path в sudoers
+sudo visudo
+# Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/myapp/bin"
+
+# Вариант 2: всегда использовать полный путь в sudo
+sudo /opt/myapp/myapp --version
+
+# Вариант 3: sudo -E с нужным PATH (см. ниже)
+```
+
+**`sudo -E` — сохранить своё окружение**
+
+Флаг `-E` (или `--preserve-env`) передаёт текущее окружение в команду запускаемую через sudo, обходя `env_reset`:
+
+```bash
+export MYVAR=hello
+export CUSTOM_PATH=/opt/myapp/bin
+
+sudo -E bash -c 'echo $MYVAR'
+# hello   ← переменная сохранилась
+
+sudo -E env | grep MYVAR
+# MYVAR=hello
+```
+
+> ⚠️ sudo может запрещать `-E` если в sudoers нет `SETENV` разрешения. Если получаете `sudo: you are not permitted to use the -E option` — нужно добавить в правило:
+
+```
+# в sudoers — разрешить сохранение окружения
+alice  ALL=(root)  SETENV: NOPASSWD: /usr/bin/myapp
+```
+
+**`env_keep` — белый список переменных которые всегда передаются**
+
+Более гибкий подход: не отключать `env_reset` полностью, а добавить конкретные переменные в белый список:
+
+```bash
+# в sudoers — всегда передавать эти переменные даже при env_reset
+sudo visudo
+# Defaults env_keep += "MYVAR"
+# Defaults env_keep += "http_proxy https_proxy no_proxy"
+# Defaults env_keep += "LANG LC_ALL LC_MESSAGES"
+```
+
+```bash
+# проверить какие переменные передаются сейчас
+sudo -l | grep env_keep
+```
+
+**Итоговая схема как sudo обрабатывает окружение:**
+
+```
+Ваше окружение (env)
+        │
+        ▼
+   env_reset включён?
+    ├── Нет  → передать всё окружение как есть
+    └── Да   → начать с минимального окружения
+                + добавить переменные из env_keep
+                + добавить переменные переданные через VAR=val sudo cmd
+                │
+                ▼
+              окружение команды запускаемой от root
+```
+
+### Псевдонимы в sudoers — для крупных конфигураций
+
+Когда пользователей и правил много — используют псевдонимы чтобы не дублировать строки:
+
+```
+# Псевдонимы пользователей
+User_Alias  ADMINS = alice, bob, charlie
+User_Alias  DEPLOYERS = deploy, ci-runner
+
+# Псевдонимы команд
+Cmnd_Alias  SERVICES = /usr/bin/systemctl start *, \
+                       /usr/bin/systemctl stop *, \
+                       /usr/bin/systemctl restart *
+Cmnd_Alias  LOGS = /usr/bin/journalctl, /usr/bin/tail
+
+# Применение
+ADMINS    ALL=(root)  ALL
+DEPLOYERS ALL=(root)  NOPASSWD: SERVICES, LOGS
+```
+
+### Логирование sudo
+
+Все действия через sudo логируются — это критично для аудита:
+
+```bash
+# посмотреть кто и что делал через sudo
+grep sudo /var/log/auth.log | tail -20
+
+# пример записи:
+# Jan 15 14:32:01 hostname sudo: fa1ry : TTY=pts/0 ;
+#   PWD=/home/fa1ry ; USER=root ; COMMAND=/usr/bin/systemctl restart nginx
+#   ─────           ────────────────────────────────────────────────────
+#   кто             что именно сделал — полный аудит
+
+# только неудачные попытки
+grep "sudo.*NOT in sudoers\|sudo.*incorrect password" /var/log/auth.log
+```
+
+---
+
+## 10. su и su- — переключение пользователей
+
+**`su` (substitute user)** — переключиться на другого пользователя. В отличие от sudo — требует **пароль целевого пользователя**, а не свой.
+
+```bash
+su alice       # переключиться на alice (нужен пароль alice)
+su - alice     # переключиться + загрузить полное окружение alice
+su -           # переключиться на root (нужен пароль root)
+```
+
+### Разница su и su-
+
+```bash
+# su alice — меняет только UID, окружение остаётся от предыдущего пользователя
+su alice
+echo $HOME
+# /home/fa1ry   ← всё ещё старая домашняя директория!
+echo $PATH
+# PATH текущего пользователя
+
+# su - alice — полноценный login: меняет UID и загружает окружение alice
+su - alice
+echo $HOME
+# /home/alice   ← теперь правильно
+echo $PATH
+# PATH из ~/.profile alice
+```
+
+Тире после `su` означает «запустить login shell» — то же что при SSH входе. Всегда используйте `su -` чтобы получить правильное окружение.
+
+### su vs sudo — когда что использовать
+
+| | `sudo command` | `su -` |
+|-|---------------|--------|
+| Нужен пароль | Ваш собственный | Пароль целевого пользователя |
+| Аудит | Каждая команда — имя пользователя + команда | После входа — действия от root, не видно кто |
+| Гранулярность | Конкретные разрешённые команды | Полный доступ |
+| Best practice | ✅ Рекомендуется | ⚠️ Только если sudo недоступен |
+
+> **Почему sudo лучше для команды:** если 5 администраторов работают через `su -`, в логах всё видно как `root`. Через `sudo` — в логах имя конкретного человека и именно та команда которую он запустил.
+
+### Отключение прямого входа root
+
+На production серверах прямой вход root принято отключать:
+
+```bash
+# заблокировать пароль root (не удалить — просто сделать невозможным вход по паролю)
+sudo passwd -l root
+
+# проверить — в /etc/shadow у root будет ! перед хэшем
+sudo grep "^root:" /etc/shadow
+# root:!$6$hash...:   ← ! = заблокирован
+
+# при этом sudo -i всё ещё работает если есть права
+sudo -i
+```
+
+---
+
+## 11. Анти-паттерны
+
+### Запускать сервисы от root
+
+```ini
+# ❌ — нет User= = запуск от root = если взломают получат root
+[Service]
+ExecStart=/usr/sbin/nginx
+
+# ✅
+[Service]
+User=www-data
+Group=www-data
+ExecStart=/usr/sbin/nginx
+```
+
+---
+
+### `usermod -G` вместо `usermod -aG`
+
+```bash
+# ❌ — ЗАМЕНЯЕТ все группы на одну
+sudo usermod -G developers alice
+# alice теперь только в developers — потеряла sudo и всё остальное!
+
+# ✅ — ДОБАВЛЯЕТ к существующим
+sudo usermod -aG developers alice
+```
+
+---
+
+### Редактировать sudoers напрямую
+
+```bash
+# ❌ — ошибка = sudo заблокировано на всей системе
+sudo nano /etc/sudoers
+
+# ✅ — visudo проверяет синтаксис перед сохранением
+sudo visudo
+sudo visudo -f /etc/sudoers.d/myapp
+```
+
+---
+
+### NOPASSWD для ALL команд
+
+```
+# ❌ — пользователь может сделать что угодно без пароля
+deploy  ALL=(root)  NOPASSWD: ALL
+
+# ✅ — только конкретные нужные команды
+deploy  ALL=(root)  NOPASSWD: /usr/bin/systemctl restart myapp, \
+                               /usr/bin/systemctl status myapp
+```
+
+---
+
+### Один сервисный пользователь для всего
+
+```bash
+# ❌ — nginx, php-fpm и приложение все от www-data
+# если взломан один — доступны файлы всех
+
+# ✅ — отдельный пользователь для каждого сервиса
+User=nginx      # только nginx процессы
+User=php-fpm    # только php-fpm
+User=myapp      # только приложение
+```
+
+---
+
+### Хранить пароль root включённым
+
+```bash
+# ❌ — на production серверах пароль root должен быть заблокирован
+# Вход только через sudo от именованных пользователей
+
+# ✅
+sudo passwd -l root
+# теперь войти по паролю как root нельзя
+# sudo -i работает для тех у кого есть права
+```
+
+---
+
+## 12. Реальные кейсы с дебагом
+
+### Кейс 1: «Пользователь добавлен в группу, но доступа нет»
+
+**Симптом:** добавили `alice` в группу `developers`, но `alice` не может читать файлы группы.
+
+```bash
+# Шаг 1: проверяем что группа реально добавлена в /etc/group
+grep developers /etc/group
+# developers:x:1001:alice   ← alice есть в файле
+
+# Шаг 2: проверяем текущие группы в сессии alice
+# (от имени alice)
+id
+# uid=1000(alice) gid=1000(alice) groups=1000(alice)
+# ← developers нет! сессия создана ДО добавления в группу
+
+# Причина: группы применяются при создании сессии (login).
+# Текущая сессия не знает о новой группе.
+
+# Шаг 3: применить без перелогина
+newgrp developers   # переключить активную группу в текущей сессии
+
+# или попросить alice выйти и войти заново
+
+# Шаг 4: проверить
+id
+# uid=1000(alice) gid=1001(developers) groups=1000(alice),1001(developers) ← есть
+
+# Диагностический трюк: посмотреть группы процесса напрямую
+cat /proc/$(pgrep -u alice bash | head -1)/status | grep Groups
+# Groups: 1000 1001   ← числа GID, должен быть 1001
+```
+
+---
+
+### Кейс 2: «sudo: command not found» хотя команда есть
+
+**Симптом:** `mycommand` работает, `sudo mycommand` — `command not found`.
+
+```bash
+# Шаг 1: найти где находится команда
+which mycommand
+# /usr/local/bin/mycommand
+
+# Шаг 2: посмотреть PATH при sudo (он другой!)
+sudo env | grep PATH
+# PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Шаг 3: проверить secure_path в sudoers
+sudo grep secure_path /etc/sudoers
+# Defaults   secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# secure_path — PATH который sudo использует для поиска команд
+# если нужного пути нет — добавить
+
+# Решение 1: добавить путь в secure_path
+sudo visudo
+# Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/myapp/bin"
+
+# Решение 2: указывать полный путь в sudo
+sudo /usr/local/bin/mycommand
+```
+
+---
+
+### Кейс 3: «Permission denied несмотря на правильные права на файл»
+
+**Симптом:** сервис `myapp` запущен от пользователя `myapp`, файл принадлежит `myapp`, но `Permission denied`.
+
+```bash
+# Шаг 1: смотрим точную ошибку
+journalctl -u myapp -b 0 | grep -i "permission\|denied\|EACCES"
+# open("/var/lib/myapp/data/config.json") = -1 EACCES
+
+# Шаг 2: проверяем права файла
+ls -la /var/lib/myapp/data/config.json
+# -rw-r--r-- 1 myapp myapp   ← права на файл OK
+
+# Шаг 3: проверяем ВСЬЮ ЦЕПОЧКУ директорий
+# namei показывает права каждого компонента пути
+namei -l /var/lib/myapp/data/config.json
+# f: /var/lib/myapp/data/config.json
+#  drwxr-xr-x root  root   /
+#  drwxr-xr-x root  root   var
+#  drwxr-xr-x root  root   lib
+#  drwx------ root  root   myapp     ← ПРОБЛЕМА: только root может войти!
+#  drwxr-xr-x myapp myapp  data
+#  -rw-r--r-- myapp myapp  config.json
+
+# Шаг 4: исправляем права на директорию
+sudo chown myapp:myapp /var/lib/myapp
+sudo chmod 750 /var/lib/myapp
+
+# Шаг 5: проверяем
+namei -l /var/lib/myapp/data/config.json
+# drwx------ → drwxr-x---   ← теперь myapp может войти
+```
+
+---
+
+### Кейс 4: «Сломан sudoers — sudo не работает»
+
+**Симптом:** отредактировали `/etc/sudoers` напрямую, сделали ошибку. `sudo visudo` — `syntax error`.
+
+```bash
+# sudo не работает — несколько способов восстановить:
+
+# Способ 1: pkexec — альтернатива sudo через PolicyKit
+pkexec visudo
+
+# Способ 2: если есть активная root сессия в другом терминале
+# просто исправить файл там
+
+# Способ 3: su (если знаем пароль root)
+su -
+nano /etc/sudoers   # исправляем ошибку
+
+# Способ 4: recovery mode
+# Перезагрузка → GRUB → Advanced options → recovery mode → root shell
+mount -o remount,rw /   # примонтировать корень на запись
+visudo                  # исправить
+
+# Профилактика — ВСЕГДА только visudo:
+sudo visudo             # проверяет синтаксис перед сохранением
+sudo visudo -c          # только проверить синтаксис без редактирования
+```
+
+---
+
+### Кейс 5: «CI/CD нужно перезапускать сервис»
+
+**Симптом:** деплой-скрипт от пользователя `deploy` должен перезапускать сервис, но нет прав.
+
+```bash
+# Шаг 1: создаём минимальное правило — только нужные команды
+sudo visudo -f /etc/sudoers.d/deploy
+```
+
+```
+# /etc/sudoers.d/deploy
+# Только конкретные операции с конкретным сервисом
+deploy  ALL=(root)  NOPASSWD: /usr/bin/systemctl start myapp, \
+                               /usr/bin/systemctl stop myapp, \
+                               /usr/bin/systemctl restart myapp, \
+                               /usr/bin/systemctl status myapp
+```
+
+```bash
+# Шаг 2: проверить синтаксис
+sudo visudo -c -f /etc/sudoers.d/deploy
+# parsed OK
+
+# Шаг 3: проверить что deploy может делать
+sudo -l -U deploy
+# (root) NOPASSWD: /usr/bin/systemctl start myapp
+# (root) NOPASSWD: /usr/bin/systemctl stop myapp
+# ...
+
+# Шаг 4: убедиться что нельзя выйти за пределы
+sudo -u deploy sudo systemctl restart nginx
+# Sorry, user deploy is not allowed to execute '...restart nginx'
+# ← только myapp, не nginx
+```
+
+---
+
+## 13. Вопросы на собесе
+
+### Базовый уровень
+
+**В: Чем /etc/passwd отличается от /etc/shadow? Почему пароли вынесены отдельно?**
+> О: `/etc/passwd` содержит информацию о пользователях — UID, GID, домашняя директория, оболочка. Он читаем всеми потому что нужен для перевода UID в имена (например `ls -la`). Хэши паролей раньше хранились прямо в passwd, но так как файл открыт всем — любой мог забрать хэши и взломать офлайн. Поэтому хэши вынесли в `/etc/shadow` который доступен только root.
+
+**В: Что такое UID и почему у root UID=0?**
+> О: UID — числовой идентификатор пользователя. Linux не знает имён — ядро оперирует только числами. UID=0 — это магическое число которое ядро проверяет при системных операциях. Процесс с euid=0 получает привилегированный доступ. Имя `root` — просто запись в `/etc/passwd` которая маппится на число 0.
+
+**В: Зачем нужны сервисные пользователи типа www-data?**
+> О: Принцип наименьших привилегий. Если nginx запущен от root и его взломали — атакующий получает полный root доступ к серверу. Если nginx от `www-data` с доступом только к `/var/www` — ущерб ограничен. Сервисные пользователи не могут логиниться (оболочка `/usr/sbin/nologin`), изолированы друг от друга, и при компрометации одного остальные сервисы не затронуты.
+
+---
+
+### Middle уровень
+
+**В: Как работает sudo изнутри? Почему не нужен пароль root?**
+> О: `/usr/bin/sudo` имеет SUID бит — при запуске процесс получает euid=0 (root). sudo читает `/etc/sudoers`, проверяет разрешение для текущего пользователя, запрашивает ваш пароль через PAM (не root), и если всё ок — запускает команду с нужными правами. Пароль root не нужен — вы доказываете что вы это вы, а конфиг определяет что вам разрешено.
+
+**В: Чем `su -` отличается от `su` и чем оба отличаются от `sudo -i`?**
+> О: `su alice` — меняет UID, но переменные окружения остаются старые (`$HOME`, `$PATH` предыдущего пользователя). `su - alice` — полноценный login: меняет UID и загружает окружение alice через её `.profile`. `sudo -i` — то же что `su -` для root, но с логированием: в audit логах видно кто именно запустил root сессию. Для аудита `sudo -i` лучше — в логах имя конкретного человека.
+
+**В: Добавили пользователя в группу командой, но доступа нет. Почему?**
+> О: Группы применяются при создании сессии при логине. Текущие процессы сессии не знают о новой группе — она появится только при следующем входе. Проверить реальные группы: `cat /proc/<PID>/status | grep Groups`. Временное решение: `newgrp groupname` в текущей сессии. Постоянное: выйти и войти заново.
+
+**В: Что такое Real, Effective и Saved UID?**
+> О: Real UID — кто реально запустил процесс. Effective UID — от чьего имени ядро проверяет права при каждой операции (это число ядро смотрит при `open()`, `read()`, `kill()` и т.д.). Saved UID — сохранённый euid, позволяет процессу временно сбросить привилегии до ruid и вернуть. Пример: sudo имеет ruid=1000 (вы), euid=0 (root). Приложения с SUID могут менять euid между ruid и saved uid для минимизации времени с привилегиями.
+
+**В: Почему нельзя редактировать /etc/sudoers напрямую?**
+> О: Синтаксическая ошибка в sudoers полностью блокирует sudo на системе. Восстановить можно только через pkexec, su или recovery mode. `visudo` блокирует файл от параллельного редактирования и проверяет синтаксис перед сохранением — не даст сохранить файл с ошибкой. Лучше использовать `/etc/sudoers.d/` с отдельными файлами — ошибка в одном файле не блокирует остальные.
+
+**В: Что такое PAM и почему sudo использует его вместо прямой проверки пароля?**
+> О: PAM (Pluggable Authentication Modules) — архитектура подключаемых модулей аутентификации. sudo делегирует проверку пароля PAM чтобы не реализовывать её самому. Преимущество: можно изменить метод аутентификации не меняя sudo. Например добавить 2FA через Google Authenticator — достаточно вставить модуль в `/etc/pam.d/sudo`. PAM обрабатывает четыре цепочки: `auth` (кто ты), `account` (можешь ли ты), `password` (смена секрета), `session` (настройка окружения).
+
+**В: Почему `grep /etc/passwd` не находит пользователя, а `getent passwd` находит?**
+> О: Потому что `/etc/passwd` — не единственный источник пользователей. Система использует NSS (Name Service Switch) который определяет порядок источников в `/etc/nsswitch.conf`. Строка `passwd: files sssd` означает: сначала файл, потом SSSD который может отдавать пользователей из LDAP или Active Directory. `getent passwd` опрашивает все источники через NSS, `grep /etc/passwd` — только локальный файл.
+
+**В: Что такое SSSD и зачем он нужен?**
+> О: SSSD (System Security Services Daemon) — демон-посредник между Linux хостом и централизованными хранилищами учётных записей: Active Directory, LDAP, FreeIPA. Он кэширует данные пользователей локально — пользователь может войти даже при недоступности AD. Без SSSD в компании с 1000 серверов нужно создавать каждого пользователя вручную на каждом сервере. С SSSD — создаёте один раз в AD, все серверы автоматически видят пользователя.
+
+**В: sudo: команда не найдена, хотя в обычной сессии работает. Почему?**
+> О: sudo использует собственный PATH из директивы `secure_path` в sudoers, который полностью заменяет ваш PATH. Этот PATH может не содержать директорию где лежит команда. Диагностика: `sudo env | grep PATH`. Решения: добавить путь в `secure_path`, указать полный путь к команде, или использовать `sudo -E` если в sudoers разрешено `SETENV`.
+
+---
+
+## 14. Шпаргалка
+
+### Пользователи
+
+```bash
+id [user]                                   # UID, GID, все группы
+getent passwd [user]                         # запись из базы пользователей
+getent group [group]                         # запись группы
+grep "^username:" /etc/passwd               # строка в passwd
+
+# Создание
+useradd -m -s /bin/bash -G sudo alice       # обычный пользователь
+useradd --system --no-create-home \
+  --shell /usr/sbin/nologin myapp           # сервисный пользователь
+
+# Изменение
+usermod -aG developers alice               # добавить в группу (обязательно -a!)
+usermod -s /bin/bash alice                 # сменить оболочку
+usermod -L alice                           # заблокировать
+usermod -U alice                           # разблокировать
+
+# Удаление
+userdel -r alice                           # удалить с домашней директорией
+
+# Пароли и политика
+passwd alice                               # сменить пароль
+passwd -l alice                            # заблокировать аккаунт
+passwd -S alice                            # статус аккаунта
+chage -l alice                             # политика паролей
+chage -M 90 alice                          # истечение через 90 дней
+```
+
+### sudo
+
+```bash
+sudo command                               # от root
+sudo -u alice command                      # от alice
+sudo -i                                    # root login shell (с профилем)
+sudo -s                                    # root shell (без профиля)
+sudo -l                                    # что разрешено мне
+sudo -l -U alice                           # что разрешено alice
+
+sudo visudo                                # редактировать sudoers
+sudo visudo -f /etc/sudoers.d/myapp        # создать правило
+sudo visudo -c                             # проверить синтаксис
+
+# Логи
+grep sudo /var/log/auth.log | tail -20
+grep "NOT in sudoers\|incorrect password" /var/log/auth.log
+```
+
+### NSS и SSSD
+
+```bash
+# опросить все источники (файлы + SSSD/LDAP)
+getent passwd alice              # найти пользователя
+getent passwd 1000               # найти по UID
+getent group developers          # найти группу
+
+# SSSD диагностика
+systemctl status sssd
+sss_cache -E                     # очистить кэш SSSD
+journalctl -u sssd -f
+tail -f /var/log/sssd/sssd_*.log
+
+# конфиг NSS
+cat /etc/nsswitch.conf
+```
+
+### PAM
+
+```bash
+ls /etc/pam.d/                   # все PAM конфиги
+cat /etc/pam.d/sudo              # цепочка для sudo
+cat /etc/pam.d/common-auth       # общие правила аутентификации
+```
+
+### sudo — переменные окружения
+
+```bash
+sudo -E command                  # сохранить текущее окружение
+sudo env | grep PATH             # PATH который видит sudo
+VAR=value sudo command           # передать одну переменную
+
+# в sudoers:
+# Defaults env_keep += "MYVAR http_proxy"   — белый список переменных
+# Defaults secure_path="/usr/local/sbin:..."  — PATH для sudo
+# alice ALL=(root) SETENV: ALL               — разрешить -E
+```
+
+```bash
+namei -l /path/to/file                     # права всей цепочки пути
+stat file                                  # подробная информация о файле
+cat /proc/<PID>/status | grep -E "^(Uid|Gid|Groups)"  # UID/GID процесса
+```
+
+### Ключевые файлы
+
+| Файл | Права | Содержит |
+|------|-------|----------|
+| `/etc/passwd` | `644` | Пользователи: UID, GID, оболочка, домашняя директория |
+| `/etc/shadow` | `640` root:shadow | Хэши паролей, политики истечения |
+| `/etc/group` | `644` | Группы: GID, список пользователей |
+| `/etc/nsswitch.conf` | `644` | Порядок источников для NSS (files, sssd, dns...) |
+| `/etc/sssd/sssd.conf` | `600` root | Конфигурация SSSD (LDAP/AD параметры) |
+| `/etc/sudoers` | `440` | Правила sudo — только через `visudo` |
+| `/etc/sudoers.d/` | `750` | Дополнительные правила sudo |
+| `/etc/pam.d/sudo` | `644` | PAM цепочка для sudo |
+| `/etc/pam.d/common-auth` | `644` | Общие правила аутентификации |
+| `/etc/skel/` | `755` | Шаблон домашней директории |
+| `/etc/login.defs` | `644` | Диапазоны UID, политики паролей |
+
+---
+
+*Управление пользователями, группами и привилегиями · DevOps Middle+*

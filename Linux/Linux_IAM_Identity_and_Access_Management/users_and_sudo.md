@@ -9,16 +9,13 @@
 2. [/etc/passwd — что хранится и почему именно там](#2-etcpasswd)
 3. [/etc/shadow — почему пароли вынесены отдельно](#3-etcshadow)
 4. [/etc/group — группы и зачем они нужны](#4-etcgroup)
-5. [NSS — откуда система берёт данные о пользователях](#5-nss)
-6. [SSSD, LDAP, Active Directory — централизованное управление](#6-sssd-ldap-active-directory)
-7. [Типы пользователей — системные, сервисные, обычные](#7-типы-пользователей)
-8. [Управление пользователями и группами](#8-управление-пользователями-и-группами)
-9. [sudo — механизм повышения привилегий](#9-sudo--механизм-повышения-привилегий)
-10. [su и su- — переключение пользователей](#10-su-и-su---переключение-пользователей)
-11. [Анти-паттерны](#11-анти-паттерны)
-12. [Реальные кейсы с дебагом](#12-реальные-кейсы-с-дебагом)
-13. [Вопросы на собесе](#13-вопросы-на-собесе)
-14. [Шпаргалка](#14-шпаргалка)
+5. [Типы пользователей — системные, сервисные, обычные](#5-типы-пользователей)
+6. [Управление пользователями и группами](#6-управление-пользователями-и-группами)
+7. [sudo — механизм повышения привилегий](#7-sudo--механизм-повышения-привилегий)
+8. [su и su- — переключение пользователей](#8-su-и-su---переключение-пользователей)
+9. [Анти-паттерны](#9-анти-паттерны)
+10. [Реальные кейсы с дебагом](#10-реальные-кейсы-с-дебагом)
+11. [Вопросы на собесе](#11-вопросы-на-собесе)
 
 ---
 
@@ -321,156 +318,7 @@ ls -la project_file
 
 ---
 
-## 5. NSS
-
-### /etc/nsswitch.conf — откуда система берёт данные о пользователях
-
-Большинство думают что `/etc/passwd` — единственный источник данных о пользователях. Это не так. Linux использует слой абстракции **NSS (Name Service Switch)** который определяет порядок и источники поиска для разных типов данных.
-
-**NSS (Name Service Switch)** — это механизм ядра и libc, который говорит системе: «когда тебе нужно найти пользователя по имени или UID — вот список источников и в каком порядке их опрашивать».
-
-```bash
-cat /etc/nsswitch.conf
-```
-
-```
-passwd:   files sssd
-group:    files sssd
-shadow:   files sssd
-hosts:    files dns
-networks: files
-```
-
-Разбор строки `passwd: files sssd`:
-
-```
-passwd: files  sssd
-         │      │
-         │      └── если не нашли в files — идём в SSSD
-         │           (который может связываться с LDAP, AD, FreeIPA)
-         └── сначала смотреть в /etc/passwd
-```
-
-### Источники NSS и их смысл
-
-| Источник | Что это |
-|---------|---------|
-| `files` | Локальные файлы: `/etc/passwd`, `/etc/group`, `/etc/shadow` |
-| `dns` | DNS сервер (для hosts, networks) |
-| `sssd` | SSSD daemon — кэш и посредник к LDAP/AD/FreeIPA |
-| `ldap` | Прямое обращение к LDAP (устарело, лучше через sssd) |
-| `nis` | NIS/YP — очень старый протокол, почти не используется |
-| `systemd` | Динамические пользователи создаваемые systemd |
-
-### Как это влияет на повседневную работу
-
-```bash
-# getent — правильная команда для запроса через NSS
-# в отличие от grep /etc/passwd — она опросит ВСЕ источники
-
-getent passwd alice          # найти пользователя (файлы + SSSD/LDAP)
-getent passwd 1000           # найти по UID
-getent group developers      # найти группу
-getent hosts myserver        # найти хост (файлы + DNS)
-
-# пример: alice есть в AD но не в /etc/passwd
-grep alice /etc/passwd       # ← пусто
-getent passwd alice          # ← alice:x:10042:10042:Alice Dev:/home/alice:/bin/bash
-#                              ← нашли через SSSD из Active Directory!
-```
-
-> ⚠️ **Частая ошибка:** скрипт использует `grep /etc/passwd` для проверки существования пользователя. На серверах с SSSD/LDAP это не работает — пользователи из AD там не видны. Правильно: `getent passwd username`.
-
----
-
-## 6. SSSD, LDAP, Active Directory
-
-### Проблема без централизации
-
-В небольшой компании можно создавать пользователей на каждом сервере вручную. При 10 серверах и 10 сотрудниках это уже 100 операций. При 1000 серверов — это невозможно. Нужен единый источник правды.
-
-```
-Без централизации:                  С централизацией (SSSD + AD):
-────────────────────────            ────────────────────────────────
-server1: useradd alice              Создать alice один раз в AD
-server2: useradd alice
-server3: useradd alice              Все серверы автоматически видят alice
-...                                 через SSSD → Linux хост запрашивает AD
-server1000: useradd alice
-                                    Уволился bob → удалить из AD один раз
-Уволился bob?                       → bob не может войти ни на один сервер
-→ userdel bob на каждом сервере
-```
-
-### SSSD — что это и зачем
-
-**SSSD (System Security Services Daemon)** — демон который выступает посредником между Linux хостом и централизованными хранилищами учётных записей: Active Directory, LDAP, FreeIPA. Он кэширует данные пользователей и групп локально — пользователь может войти даже если AD временно недоступен.
-
-```
-Linux хост
-  │
-  ├── PAM        ─────────────────────┐
-  └── NSS (passwd: files sssd)        │
-              │                       │
-              ▼                       ▼
-           SSSD daemon  ←──── /var/lib/sss/db/ (локальный кэш)
-              │
-              ├── LDAP provider   →  OpenLDAP / FreeIPA
-              ├── AD provider     →  Active Directory
-              └── Kerberos        →  аутентификация через Kerberos тикеты
-```
-
-### Что нужно знать DevOps Middle
-
-Вы не обязаны уметь настраивать SSSD с нуля, но должны понимать архитектуру и уметь диагностировать базовые проблемы:
-
-```bash
-# установлен ли SSSD
-systemctl status sssd
-
-# конфиг
-cat /etc/sssd/sssd.conf
-# [sssd]
-# domains = company.com
-# services = nss, pam
-#
-# [domain/company.com]
-# id_provider = ad
-# auth_provider = ad
-# ad_domain = company.com
-# ad_server = dc01.company.com
-
-# работает ли — найти пользователя из AD
-getent passwd alice@company.com
-
-# очистить кэш SSSD (при проблемах со старыми данными)
-sudo sss_cache -E
-
-# посмотреть логи SSSD
-journalctl -u sssd -f
-tail -f /var/log/sssd/sssd_company.com.log
-
-# проверить Kerberos билет (для AD аутентификации)
-klist
-```
-
-### FreeIPA — Linux-native альтернатива AD
-
-**FreeIPA** — opensource решение от Red Hat. Объединяет LDAP (389-ds), Kerberos, DNS, sudo политики и PKI в одном продукте. Стандартный выбор для Linux-ориентированных инфраструктур.
-
-```bash
-# на клиенте — присоединиться к домену FreeIPA
-ipa-client-install --domain=ipa.company.com --server=ipa01.company.com
-
-# проверить членство
-id alice
-# uid=10042(alice) gid=10042(alice) groups=10042(alice),10100(developers)
-# ← пользователь из FreeIPA, не из /etc/passwd
-```
-
----
-
-## 7. Типы пользователей
+## 5. Типы пользователей
 
 В Linux три категории пользователей с разными диапазонами UID:
 
@@ -532,7 +380,7 @@ grep myapp /etc/passwd
 
 ---
 
-## 8. Управление пользователями и группами
+## 6. Управление пользователями и группами
 
 ### useradd vs adduser
 
@@ -607,7 +455,7 @@ getent group developers         # запись группы
 
 ---
 
-## 9. sudo — механизм повышения привилегий
+## 7. sudo — механизм повышения привилегий
 
 ### Что такое sudo и как оно работает изнутри
 
@@ -644,67 +492,18 @@ systemctl restart nginx запускается с UID=0 (root)
 
 ### PAM — как sudo проверяет пароль
 
-sudo не проверяет пароль самостоятельно. Он делегирует всю аутентификацию системе **PAM (Pluggable Authentication Modules)**.
-
-**PAM** — это архитектура подключаемых модулей аутентификации в Linux. Идея: отделить «кто и что хочет сделать» от «как проверить что это именно он». sudo говорит PAM: «нужно аутентифицировать пользователя» — а PAM уже решает как именно, используя цепочку модулей.
+sudo не проверяет пароль самостоятельно. Он делегирует аутентификацию **PAM (Pluggable Authentication Modules)** — архитектуре подключаемых модулей, которая отделяет «кто хочет что сделать» от «как именно проверить». sudo вызывает `pam_authenticate()` — PAM сам решает как: пароль, 2FA, LDAP, fingerprint.
 
 ```bash
 cat /etc/pam.d/sudo
-# @include common-auth         ← общие правила аутентификации
-# @include common-account      ← проверка аккаунта (не заблокирован ли)
+# @include common-auth    ← цепочка проверки пароля
+# @include common-account ← проверка аккаунта (не заблокирован ли, не истёк)
 # @include common-session-noninteractive
 ```
 
-PAM строит обработку из четырёх типов цепочек:
-
-| Тип | Когда используется | Примеры модулей |
-|-----|-------------------|-----------------|
-| `auth` | Проверить что пользователь — это тот кто он есть | `pam_unix` (пароль), `pam_google_authenticator` (2FA), `pam_fprintd` (отпечаток) |
-| `account` | Проверить что аккаунт может выполнять операцию | `pam_unix` (не истёк ли аккаунт), `pam_time` (допустимое время) |
-| `password` | Изменить аутентификационные данные | `pam_unix` (смена пароля), требования к сложности |
-| `session` | Настроить и завершить сессию | `pam_limits` (применить ulimits), `pam_env` (переменные окружения) |
-
-Каждая строка в PAM файле имеет управляющий флаг:
-
+Именно здесь настраивается 2FA для sudo — добавить строку перед `@include common-auth`:
 ```
-тип      флаг        модуль
-─────    ────────    ─────────────────────────────
-auth     required    pam_unix.so    ← должен пройти, продолжаем цепочку
-auth     requisite   pam_unix.so    ← не прошёл — немедленно отказать
-auth     sufficient  pam_unix.so    ← прошёл — достаточно, не продолжать
-auth     optional    pam_unix.so    ← результат не влияет на итог
-```
-
-**Практическое применение — добавить 2FA к sudo:**
-
-```bash
-# установить Google Authenticator PAM модуль
-apt install libpam-google-authenticator
-
-# настроить для пользователя
-google-authenticator   # создаст ~/.google_authenticator с QR кодом
-
-# добавить в /etc/pam.d/sudo
-sudo nano /etc/pam.d/sudo
-# добавить строку ПЕРЕД @include common-auth:
-# auth required pam_google_authenticator.so
-
-# теперь sudo будет спрашивать пароль + OTP код
-sudo systemctl restart nginx
-# [sudo] password for alice:
-# Verification code:   ← Google Authenticator
-```
-
-```bash
-# посмотреть все PAM конфиги
-ls /etc/pam.d/
-# common-auth  common-account  sudo  sshd  login  su  ...
-
-# sudo использует common-auth который обычно выглядит так:
-cat /etc/pam.d/common-auth
-# auth  [success=1 default=ignore]  pam_unix.so nullok
-# auth  requisite                   pam_deny.so
-# auth  required                    pam_permit.so
+auth required pam_google_authenticator.so
 ```
 
 ### /etc/sudoers — синтаксис и логика
@@ -935,7 +734,7 @@ grep "sudo.*NOT in sudoers\|sudo.*incorrect password" /var/log/auth.log
 
 ---
 
-## 10. su и su- — переключение пользователей
+## 8. su и su- — переключение пользователей
 
 **`su` (substitute user)** — переключиться на другого пользователя. В отличие от sudo — требует **пароль целевого пользователя**, а не свой.
 
@@ -994,7 +793,7 @@ sudo -i
 
 ---
 
-## 11. Анти-паттерны
+## 9. Анти-паттерны
 
 ### Запускать сервисы от root
 
@@ -1079,7 +878,7 @@ sudo passwd -l root
 
 ---
 
-## 12. Реальные кейсы с дебагом
+## 10. Реальные кейсы с дебагом
 
 ### Кейс 1: «Пользователь добавлен в группу, но доступа нет»
 
@@ -1246,7 +1045,7 @@ sudo -u deploy sudo systemctl restart nginx
 
 ---
 
-## 13. Вопросы на собесе
+## 11. Вопросы на собесе
 
 ### Базовый уровень
 
@@ -1291,119 +1090,3 @@ sudo -u deploy sudo systemctl restart nginx
 > О: sudo использует собственный PATH из директивы `secure_path` в sudoers, который полностью заменяет ваш PATH. Этот PATH может не содержать директорию где лежит команда. Диагностика: `sudo env | grep PATH`. Решения: добавить путь в `secure_path`, указать полный путь к команде, или использовать `sudo -E` если в sudoers разрешено `SETENV`.
 
 ---
-
-## 14. Шпаргалка
-
-### Пользователи
-
-```bash
-id [user]                                   # UID, GID, все группы
-getent passwd [user]                         # запись из базы пользователей
-getent group [group]                         # запись группы
-grep "^username:" /etc/passwd               # строка в passwd
-
-# Создание
-useradd -m -s /bin/bash -G sudo alice       # обычный пользователь
-useradd --system --no-create-home \
-  --shell /usr/sbin/nologin myapp           # сервисный пользователь
-
-# Изменение
-usermod -aG developers alice               # добавить в группу (обязательно -a!)
-usermod -s /bin/bash alice                 # сменить оболочку
-usermod -L alice                           # заблокировать
-usermod -U alice                           # разблокировать
-
-# Удаление
-userdel -r alice                           # удалить с домашней директорией
-
-# Пароли и политика
-passwd alice                               # сменить пароль
-passwd -l alice                            # заблокировать аккаунт
-passwd -S alice                            # статус аккаунта
-chage -l alice                             # политика паролей
-chage -M 90 alice                          # истечение через 90 дней
-```
-
-### sudo
-
-```bash
-sudo command                               # от root
-sudo -u alice command                      # от alice
-sudo -i                                    # root login shell (с профилем)
-sudo -s                                    # root shell (без профиля)
-sudo -l                                    # что разрешено мне
-sudo -l -U alice                           # что разрешено alice
-
-sudo visudo                                # редактировать sudoers
-sudo visudo -f /etc/sudoers.d/myapp        # создать правило
-sudo visudo -c                             # проверить синтаксис
-
-# Логи
-grep sudo /var/log/auth.log | tail -20
-grep "NOT in sudoers\|incorrect password" /var/log/auth.log
-```
-
-### NSS и SSSD
-
-```bash
-# опросить все источники (файлы + SSSD/LDAP)
-getent passwd alice              # найти пользователя
-getent passwd 1000               # найти по UID
-getent group developers          # найти группу
-
-# SSSD диагностика
-systemctl status sssd
-sss_cache -E                     # очистить кэш SSSD
-journalctl -u sssd -f
-tail -f /var/log/sssd/sssd_*.log
-
-# конфиг NSS
-cat /etc/nsswitch.conf
-```
-
-### PAM
-
-```bash
-ls /etc/pam.d/                   # все PAM конфиги
-cat /etc/pam.d/sudo              # цепочка для sudo
-cat /etc/pam.d/common-auth       # общие правила аутентификации
-```
-
-### sudo — переменные окружения
-
-```bash
-sudo -E command                  # сохранить текущее окружение
-sudo env | grep PATH             # PATH который видит sudo
-VAR=value sudo command           # передать одну переменную
-
-# в sudoers:
-# Defaults env_keep += "MYVAR http_proxy"   — белый список переменных
-# Defaults secure_path="/usr/local/sbin:..."  — PATH для sudo
-# alice ALL=(root) SETENV: ALL               — разрешить -E
-```
-
-```bash
-namei -l /path/to/file                     # права всей цепочки пути
-stat file                                  # подробная информация о файле
-cat /proc/<PID>/status | grep -E "^(Uid|Gid|Groups)"  # UID/GID процесса
-```
-
-### Ключевые файлы
-
-| Файл | Права | Содержит |
-|------|-------|----------|
-| `/etc/passwd` | `644` | Пользователи: UID, GID, оболочка, домашняя директория |
-| `/etc/shadow` | `640` root:shadow | Хэши паролей, политики истечения |
-| `/etc/group` | `644` | Группы: GID, список пользователей |
-| `/etc/nsswitch.conf` | `644` | Порядок источников для NSS (files, sssd, dns...) |
-| `/etc/sssd/sssd.conf` | `600` root | Конфигурация SSSD (LDAP/AD параметры) |
-| `/etc/sudoers` | `440` | Правила sudo — только через `visudo` |
-| `/etc/sudoers.d/` | `750` | Дополнительные правила sudo |
-| `/etc/pam.d/sudo` | `644` | PAM цепочка для sudo |
-| `/etc/pam.d/common-auth` | `644` | Общие правила аутентификации |
-| `/etc/skel/` | `755` | Шаблон домашней директории |
-| `/etc/login.defs` | `644` | Диапазоны UID, политики паролей |
-
----
-
-*Управление пользователями, группами и привилегиями · DevOps Middle+*

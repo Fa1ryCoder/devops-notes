@@ -1,0 +1,772 @@
+# Аутентификация в Linux
+> Углублённая лекция · DevOps Middle+
+
+---
+
+## Содержание
+
+1. [Архитектура аутентификации — общая картина](#1-архитектура)
+2. [PAM — Pluggable Authentication Modules](#2-pam--pluggable-authentication-modules)
+3. [Важные PAM-модули](#3-важные-pam-модули)
+4. [SSH аутентификация](#4-ssh-аутентификация)
+5. [/etc/securetty — ограничение root-логина по TTY](#5-etcsecuretty)
+6. [pam_faillock — защита от брутфорса](#6-pam_faillock--защита-от-брутфорса)
+7. [/etc/security/limits.conf — ограничения ресурсов](#7-etcsecuritylimitsconf)
+8. [2FA через PAM — Google Authenticator](#8-2fa-через-pam)
+9. [Анти-паттерны](#9-анти-паттерны)
+10. [Реальные кейсы с дебагом](#10-реальные-кейсы-с-дебагом)
+11. [Вопросы на собесе](#11-вопросы-на-собесе)
+12. [Шпаргалка](#12-шпаргалка)
+
+---
+
+## 1. Архитектура
+
+### Что происходит когда вы логинитесь по SSH
+
+Ключевой вопрос: кто именно проверяет ваш пароль? Не sshd, не ядро — это делает PAM. sshd только принимает соединение и делегирует проверку.
+
+```
+Пользователь вводит пароль по SSH
+        │
+        ▼
+      sshd
+        │  вызывает PAM API: pam_authenticate()
+        ▼
+   PAM-стек (/etc/pam.d/sshd)
+        │
+        ├── pam_unix.so ──→ /etc/shadow ──→ проверяет хэш пароля
+        ├── pam_faillock.so ──→ /var/run/faillock/ ──→ не превышен ли лимит попыток
+        ├── pam_google_authenticator.so ──→ ~/.google_authenticator ──→ TOTP
+        │
+        ▼
+   PAM возвращает PAM_SUCCESS или PAM_AUTH_ERR
+        │
+        ▼
+      sshd
+        │  если успех — вызывает pam_open_session()
+        ▼
+   PAM-стек (секция session)
+        │
+        ├── pam_limits.so ──→ /etc/security/limits.conf ──→ устанавливает ulimits
+        ├── pam_unix.so ──→ записывает в /var/log/wtmp, utmp
+        │
+        ▼
+   Shell запускается уже с установленными ограничениями
+```
+
+Один и тот же механизм работает для всех сервисов: `login`, `su`, `sudo`, `sshd`, `gdm`, `screensaver`. Каждый вызывает PAM API — PAM сам разбирается как аутентифицировать, используя правила из `/etc/pam.d/`.
+
+### Три задачи аутентификации
+
+PAM разделяет три разных вопроса, которые часто смешивают:
+
+| Вопрос | PAM тип | Пример |
+|--------|---------|--------|
+| **Кто ты?** — проверка личности | `auth` | пароль, ключ, токен |
+| **Можешь ли ты войти?** — состояние аккаунта | `account` | не истёк ли пароль, не заблокирован ли |
+| **Что ты можешь делать?** — ресурсы сессии | `session` | ulimits, монтирование home, запись в wtmp |
+
+---
+
+## 2. PAM — Pluggable Authentication Modules
+
+### Концепция
+
+PAM — это API между приложениями (sshd, login, sudo) и механизмами аутентификации (пароль, LDAP, TOTP, fingerprint). Приложение не знает как именно проверяется пользователь — оно просто вызывает `pam_authenticate()` и получает результат.
+
+Без PAM каждое приложение реализовывало бы свою логику аутентификации. С PAM — изменение схемы аутентификации (добавление 2FA, переход на LDAP) делается в конфиге PAM без изменения приложений.
+
+### Конфигурационные файлы
+
+```bash
+ls /etc/pam.d/
+# common-auth   common-account   common-password   common-session
+# sshd          sudo             su                login
+# gdm-password  polkit-1         ...
+
+# На Debian/Ubuntu: common-* — базовые стеки, которые включают остальные через @include
+# На RHEL/CentOS: system-auth, password-auth — аналогичные базовые стеки
+```
+
+Каждый файл — это стек правил. Приложение при аутентификации прогоняет весь стек сверху вниз.
+
+### Формат строки
+
+```
+<тип>   <управление>   <модуль.so>   [аргументы]
+```
+
+```
+auth    required    pam_unix.so    nullok
+│       │           │              │
+│       │           │              └── аргументы модуля
+│       │           └── какой модуль вызвать (ищется в /lib/security/)
+│       └── что делать с результатом
+└── какой тип задачи: auth / account / password / session
+```
+
+### Четыре типа (management groups)
+
+**`auth`** — проверяет что пользователь тот, за кого себя выдаёт:
+- запрашивает пароль, токен, сертификат
+- устанавливает credentials (group membership)
+
+**`account`** — проверяет может ли пользователь войти прямо сейчас:
+- не истёк ли пароль
+- не заблокирован ли аккаунт
+- разрешено ли время суток, хост
+
+**`password`** — управляет сменой пароля:
+- вызывается командой `passwd`
+- проверяет сложность, историю паролей
+
+**`session`** — настройка и завершение сессии:
+- установка ulimits
+- монтирование домашней директории
+- запись в системные логи (wtmp, lastlog)
+- переменные окружения
+
+### Управляющие флаги
+
+Самое важное для понимания поведения PAM-стека:
+
+| Флаг | Если успех | Если неудача |
+|------|-----------|--------------|
+| `required` | продолжить стек | продолжить, но итог будет FAIL |
+| `requisite` | продолжить стек | **немедленно** вернуть FAIL, стек прерван |
+| `sufficient` | **немедленно** SUCCESS (если до этого не было FAIL) | продолжить стек |
+| `optional` | продолжить | продолжить (игнорируется если есть другие модули) |
+
+Разница `required` vs `requisite` критична для безопасности: `requisite` не даёт следующим модулям «утечь» информацию о существовании пользователя при неудаче.
+
+```bash
+# Расширенный синтаксис для сложных сценариев:
+auth [success=1 default=ignore] pam_unix.so nullok
+#     ─────────────────────────
+#     success=1 = если успех — пропустить следующую 1 строку
+#     default=ignore = для всех остальных исходов — продолжить
+# Используется в Ubuntu/Debian для построения гибких стеков
+```
+
+### Пример: разбор /etc/pam.d/common-auth на Ubuntu
+
+```bash
+cat /etc/pam.d/common-auth
+```
+
+```
+auth  [success=2 default=ignore]  pam_faillock.so preauth
+auth  [success=1 default=ignore]  pam_unix.so nullok
+auth  [default=die]               pam_faillock.so authfail
+auth  sufficient                  pam_faillock.so authsucc
+auth  requisite                   pam_deny.so
+auth  required                    pam_permit.so
+```
+
+Читаем построчно:
+1. `pam_faillock preauth` — проверить не заблокирован ли аккаунт. Если заблокирован → `default=ignore` не применяется, faillock вернёт FAIL и прыгаем к строке 5 (`pam_deny.so`). Если не заблокирован → `success=2`, пропускаем 2 следующие строки → к строке 4.
+2. `pam_unix nullok` — проверить пароль по /etc/shadow. Если успех → `success=1`, пропускаем 1 строку → к строке 4. Если провал → `default=ignore`, к строке 3.
+3. `pam_faillock authfail` — зафиксировать неудачную попытку. `default=die` = немедленно FAIL.
+4. `pam_faillock authsucc` — зафиксировать успешный вход, сбросить счётчик. `sufficient` = немедленно SUCCESS.
+5. `pam_deny.so` — всегда возвращает FAIL (запасной вариант).
+6. `pam_permit.so` — всегда SUCCESS (никогда не достигается в нормальном потоке).
+
+### /etc/pam.d/sshd
+
+```bash
+cat /etc/pam.d/sshd
+```
+
+```
+# Стандартный Debian/Ubuntu sshd PAM конфиг
+@include common-auth       ← включает стек из common-auth
+account  required    pam_nologin.so     ← проверить /etc/nologin
+@include common-account
+session  [success=ok ignore=ignore module_unknown=ignore default=bad] pam_selinux.so close
+session  required    pam_loginuid.so    ← установить loginuid в /proc/self/loginuid
+@include common-session
+session  optional    pam_motd.so noupdate
+session  optional    pam_mail.so standard noenv
+session  [success=ok ignore=ignore module_unknown=ignore default=bad] pam_selinux.so open
+```
+
+---
+
+## 3. Важные PAM-модули
+
+### pam_unix.so — классическая аутентификация
+
+Основной модуль. Работает с `/etc/passwd` и `/etc/shadow`.
+
+```bash
+# Ключевые аргументы:
+# nullok        — разрешить пустой пароль (небезопасно, используется для совместимости)
+# shadow        — использовать /etc/shadow (обычно включено по умолчанию)
+# try_first_pass — использовать пароль из предыдущего модуля вместо повторного запроса
+# remember=N    — не разрешать N последних паролей повторно (для секции password)
+```
+
+### pam_deny.so и pam_permit.so
+
+```bash
+# pam_deny.so  — всегда возвращает PAM_AUTH_ERR. Используется как "заглушка-запрет".
+# pam_permit.so — всегда возвращает PAM_SUCCESS. Используется как запасной "разрешить".
+# Оба модуля не принимают аргументов.
+```
+
+### pam_env.so — переменные окружения
+
+```bash
+# Устанавливает переменные окружения при логине из /etc/environment и /etc/security/pam_env.conf
+auth     required  pam_env.so readenv=1 envfile=/etc/default/locale
+```
+
+### pam_nologin.so — отключение логинов
+
+```bash
+# Если существует файл /etc/nologin — запрещает вход всем кроме root
+# и выводит содержимое файла как сообщение об ошибке
+touch /etc/nologin
+echo "Техническое обслуживание до 03:00" > /etc/nologin
+# Теперь никто кроме root не сможет залогиниться
+
+rm /etc/nologin  # снять ограничение
+```
+
+### pam_limits.so — ограничения ресурсов
+
+```bash
+# Применяет лимиты из /etc/security/limits.conf к сессии
+session required pam_limits.so
+# Без этой строки в /etc/pam.d/common-session — limits.conf не применяется!
+```
+
+### pam_time.so — ограничение по времени
+
+```bash
+# Разрешить вход только в определённое время/дни — конфиг в /etc/security/time.conf
+# login ; * ; !root ; Wk0800-1800   ← не-root может логиниться только пн-пт 08:00-18:00
+account required pam_time.so
+```
+
+---
+
+## 4. SSH аутентификация
+
+### Два принципиально разных механизма
+
+SSH поддерживает аутентификацию несколькими способами. Важно понимать: **ключевая аутентификация (publickey) не проходит через PAM**. Проверку ключа делает sshd сам. PAM при ключевой аутентификации вызывается только для `account` и `session` (если `UsePAM yes`).
+
+```
+Публичный ключ:    клиент → sshd → проверяет ~/.ssh/authorized_keys → PAM account/session
+Пароль:            клиент → sshd → PAM auth (pam_unix) → PAM account/session
+2FA (ключ+токен):  клиент → sshd → проверяет ключ → PAM auth (TOTP) → PAM account/session
+```
+
+### /etc/ssh/sshd_config — ключевые параметры
+
+```bash
+# Смотреть текущую конфигурацию (с дефолтами)
+sshd -T | grep -E "permitrootlogin|passwordauth|pubkeyauth|port"
+
+# Проверить конфиг без перезапуска
+sshd -t
+```
+
+```
+# Порт (менять не обязательно, но снижает шум в логах)
+Port 22
+
+# Запретить вход по паролю — только ключи
+PasswordAuthentication no
+PubkeyAuthentication yes
+
+# root: запретить пароль, разрешить только ключ (рекомендуется)
+PermitRootLogin prohibit-password
+# Варианты: yes / no / prohibit-password / forced-commands-only
+
+# Путь к authorized_keys (можно несколько файлов)
+AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2
+
+# PAM — нужен для account/session даже при ключах
+UsePAM yes
+
+# Для 2FA: разрешить keyboard-interactive
+ChallengeResponseAuthentication yes  # или KbdInteractiveAuthentication на новых версиях
+
+# Ограничение по пользователям/группам (работает как белый список)
+AllowGroups sshusers admins
+# DenyUsers baduser
+# AllowUsers alice bob deploy@192.168.1.0/24
+
+# Таймауты
+LoginGraceTime 30          # сколько секунд есть на аутентификацию
+MaxAuthTries 4             # максимум попыток до разрыва соединения
+ClientAliveInterval 300    # keepalive каждые 5 минут
+ClientAliveCountMax 2      # 2 пропущенных keepalive = разрыв
+```
+
+### Генерация и управление ключами
+
+```bash
+# Современный алгоритм — Ed25519 (рекомендуется)
+ssh-keygen -t ed25519 -C "fa1ry@workstation-2024"
+# Создаёт:
+#   ~/.ssh/id_ed25519       ← приватный ключ (chmod 600, никогда никому!)
+#   ~/.ssh/id_ed25519.pub   ← публичный ключ (можно раздавать)
+
+# RSA если нужна совместимость со старыми системами
+ssh-keygen -t rsa -b 4096 -C "fa1ry@workstation"
+
+# Скопировать ключ на сервер
+ssh-copy-id -i ~/.ssh/id_ed25519.pub user@server
+# Эквивалентно: cat ~/.ssh/id_ed25519.pub | ssh user@server "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
+
+# Права обязательны — sshd откажет если права неправильные
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/id_ed25519
+
+# Просмотр fingerprint ключа
+ssh-keygen -lf ~/.ssh/id_ed25519.pub
+# 256 SHA256:abc123... fa1ry@workstation (ED25519)
+```
+
+### authorized_keys — формат и опции
+
+```bash
+# Базовый формат: тип_ключа  base64_данные  комментарий
+ssh-ed25519 AAAA...xyz fa1ry@workstation
+
+# С ограничениями (опции перед ключом):
+# Только одна команда (для деплой-ключей)
+command="/usr/bin/git-shell -c \"$SSH_ORIGINAL_COMMAND\"",no-agent-forwarding,no-port-forwarding ssh-ed25519 AAAA...
+
+# Разрешить только с конкретного IP
+from="192.168.1.100,10.0.0.0/8" ssh-ed25519 AAAA...
+
+# Запретить PTY (для автоматизации)
+no-pty,no-X11-forwarding ssh-ed25519 AAAA...
+```
+
+### Диагностика проблем с SSH
+
+```bash
+# На клиенте — подробный вывод (-vvv максимальная детализация)
+ssh -v user@server
+ssh -vv user@server
+
+# На сервере — смотреть в реальном времени
+sudo journalctl -fu ssh
+sudo tail -f /var/log/auth.log | grep sshd
+
+# Частые ошибки:
+# "Permission denied (publickey)" — проверить права .ssh/, authorized_keys
+# "Too many authentication failures" — исчерпан MaxAuthTries
+# "Connection closed by authenticating user" — PAM account проверка провалилась
+
+# Проверить что sshd видит ключ (от root на сервере)
+sudo sshd -T -C user=alice,addr=10.0.0.1 | grep -E "authorizedkeysfile|pubkeyauth"
+```
+
+---
+
+## 5. /etc/securetty
+
+### Что это и зачем
+
+`/etc/securetty` — список TTY-устройств с которых разрешён вход root. Работает через модуль `pam_securetty.so` в секции `auth` конфига `/etc/pam.d/login`.
+
+```bash
+cat /etc/securetty
+# tty1
+# tty2
+# tty3
+# ...
+# console
+# (нет pts/0, pts/1 — значит SSH-терминалы не в списке)
+```
+
+Если root пытается залогиниться с TTY которого нет в `/etc/securetty` — PAM отказывает. Это защищает от входа root через сетевые псевдотерминалы.
+
+```bash
+# Для SSH: root вход по паролю контролируется через sshd_config (PermitRootLogin),
+# а не через /etc/securetty — потому что SSH не использует pam_securetty.so по умолчанию
+
+# Проверить через какие PAM-модули проходит login
+grep -r "securetty" /etc/pam.d/
+# /etc/pam.d/login: auth requisite pam_securetty.so
+```
+
+---
+
+## 6. pam_faillock — защита от брутфорса
+
+### Концепция
+
+`pam_faillock` считает неудачные попытки входа и блокирует аккаунт после N неудач. Данные хранятся в `/var/run/faillock/<username>`.
+
+На старых системах (CentOS 7, Ubuntu 18.04) использовался `pam_tally2`. На современных — `pam_faillock`.
+
+### Конфигурация через /etc/security/faillock.conf (современный способ)
+
+```bash
+cat /etc/security/faillock.conf
+```
+
+```
+# Заблокировать после 5 неудачных попыток
+deny = 5
+
+# Время блокировки в секундах (900 = 15 минут)
+unlock_time = 900
+
+# Учитывать попытки в окне N секунд
+fail_interval = 900
+
+# Не блокировать root (спорно — безопаснее блокировать, но можно заблокировать самого себя)
+# even_deny_root
+
+# Логировать через syslog
+silent
+```
+
+### Конфигурация в /etc/pam.d/common-auth
+
+```
+auth  required                    pam_faillock.so preauth
+auth  [success=1 default=ignore]  pam_unix.so nullok
+auth  [default=die]               pam_faillock.so authfail
+auth  sufficient                  pam_faillock.so authsucc
+auth  requisite                   pam_deny.so
+auth  required                    pam_permit.so
+```
+
+И в `/etc/pam.d/common-account`:
+```
+account required pam_faillock.so
+```
+
+### Управление блокировками
+
+```bash
+# Посмотреть статус пользователя
+faillock --user alice
+# alice:
+# When                Type  Source                                           Valid
+# 2024-01-15 14:32:01 RHOST 10.0.0.50                                            V
+# 2024-01-15 14:32:05 RHOST 10.0.0.50                                            V
+# ...
+
+# Разблокировать пользователя вручную
+faillock --user alice --reset
+
+# Посмотреть статус всех заблокированных
+ls /var/run/faillock/
+```
+
+---
+
+## 7. /etc/security/limits.conf
+
+### Зачем нужен
+
+`ulimit` в shell — это просто интерфейс к системным лимитам процесса. Но эти лимиты сбрасываются при каждом логине. Чтобы лимиты применялись автоматически при каждой сессии — используется `pam_limits.so` который читает `/etc/security/limits.conf`.
+
+```bash
+# Проверить текущие лимиты сессии
+ulimit -a
+
+# Hard limit: потолок который нельзя превысить без root
+# Soft limit: текущий рабочий лимит (может быть увеличен пользователем до hard)
+ulimit -Hn  # hard limit на файлы
+ulimit -Sn  # soft limit на файлы
+```
+
+### Формат файла
+
+```bash
+cat /etc/security/limits.conf
+```
+
+```
+# <domain>   <type>   <item>    <value>
+# ─────────────────────────────────────────────────
+# Конкретный пользователь
+alice         soft     nofile    65536
+alice         hard     nofile    131072
+
+# Группа (с @)
+@developers   soft     nproc     10000
+@developers   hard     nproc     20000
+
+# Все пользователи (*)
+*             soft     core      0         # отключить core dumps
+*             hard     core      0
+
+# Пример для high-load сервисов
+www-data      soft     nofile    65536
+www-data      hard     nofile    131072
+www-data      soft     nproc     32768
+```
+
+Основные параметры:
+
+| item | Смысл |
+|------|-------|
+| `nofile` | Максимум открытых файловых дескрипторов |
+| `nproc` | Максимум процессов пользователя |
+| `memlock` | Максимум памяти в RAM (для Elasticsearch, etc.) |
+| `core` | Размер core dump (0 = отключить) |
+| `stack` | Размер стека |
+| `fsize` | Максимальный размер создаваемого файла |
+
+### /etc/security/limits.d/
+
+```bash
+# Лучше создавать отдельные файлы, не редактировать основной
+ls /etc/security/limits.d/
+# 99-nginx.conf  99-elasticsearch.conf
+
+cat /etc/security/limits.d/99-nginx.conf
+# www-data  soft  nofile  65536
+# www-data  hard  nofile  65536
+```
+
+> ⚠️ Лимиты применяются только если `session required pam_limits.so` присутствует в PAM-конфиге сессии (`/etc/pam.d/common-session`). Без этой строки лимиты не работают.
+
+> ⚠️ Для systemd-сервисов (nginx, postgresql запущенные через systemd) — limits.conf не применяется. Нужно использовать `LimitNOFILE=65536` в юнит-файле или `/etc/systemd/system/nginx.service.d/override.conf`.
+
+---
+
+## 8. 2FA через PAM
+
+### Концепция: ключ + TOTP
+
+Самая безопасная схема для SSH: пользователь должен предъявить **и** приватный ключ **и** одноразовый код (TOTP). Компрометация одного фактора недостаточна.
+
+```
+SSH клиент                    sshd                    PAM
+      │                         │                       │
+      │── публичный ключ ──────→│                       │
+      │                 проверяет authorized_keys        │
+      │←─ запрос TOTP кода ─────│                       │
+      │                         │── pam_authenticate() →│
+      │── вводит код ──────────→│                       │── pam_google_authenticator.so
+      │                         │                       │   проверяет ~/.google_authenticator
+      │                         │←── PAM_SUCCESS ───────│
+      │←── сессия открыта ──────│
+```
+
+### Установка и настройка
+
+```bash
+# Шаг 1: установить PAM-модуль
+apt install libpam-google-authenticator   # Debian/Ubuntu
+dnf install google-authenticator-libpam  # RHEL/Fedora
+
+# Шаг 2: сгенерировать secret для пользователя (выполняется каждым пользователем)
+google-authenticator
+# Ответить на вопросы:
+# Do you want authentication tokens to be time-based? y
+# → показывает QR-код для сканирования в Google Authenticator / Authy
+# → показывает emergency scratch codes (сохранить в безопасном месте!)
+# Do you want to update your "/home/user/.google_authenticator" file? y
+# Do you want to disallow multiple uses of the same token? y
+# Do you want to enable rate-limiting? y
+
+# Файл ~/.google_authenticator создан — хранит secret и настройки
+chmod 400 ~/.google_authenticator  # только владелец
+```
+
+```bash
+# Шаг 3: добавить модуль в PAM для sshd
+sudo nano /etc/pam.d/sshd
+
+# Добавить в НАЧАЛО секции auth:
+auth required pam_google_authenticator.so
+# nullok — разрешить вход если пользователь не настроил 2FA (переходный период)
+# auth required pam_google_authenticator.so nullok
+```
+
+```bash
+# Шаг 4: настроить sshd чтобы требовал оба фактора
+sudo nano /etc/ssh/sshd_config
+
+# Разрешить keyboard-interactive
+KbdInteractiveAuthentication yes   # или ChallengeResponseAuthentication yes на старых версиях
+UsePAM yes
+
+# Требовать И ключ И keyboard-interactive (PAM TOTP)
+AuthenticationMethods publickey,keyboard-interactive
+
+# Шаг 5: перезапустить sshd
+sudo systemctl restart sshd
+
+# ВАЖНО: не закрывать текущую сессию пока не проверите что новая работает
+```
+
+---
+
+## 9. Анти-паттерны
+
+**Отключение PAM для sshd:**
+```
+UsePAM no   # НИКОГДА без весомой причины
+```
+Отключает pam_limits (ulimits не применяются), pam_faillock, логирование сессий. Ломает весь стек безопасности.
+
+**PasswordAuthentication yes + без fail2ban/pam_faillock:**
+Открытый SSH с паролями без защиты от брутфорса — сервер будет сканироваться и атаковаться постоянно. Проверяйте `grep "Failed password" /var/log/auth.log | wc -l`.
+
+**PermitRootLogin yes:**
+Прямой вход root по паролю через SSH. Даже если пароль сложный — не нужен: используйте обычного пользователя + sudo.
+
+**Редактировать /etc/pam.d/common-auth напрямую без бэкапа:**
+Синтаксическая ошибка в common-auth заблокирует вход через ВСЕ сервисы включая локальную консоль. Всегда держите открытой вторую сессию при правке PAM.
+
+**Пренебрегать правами на ~/.ssh:**
+```bash
+# Если права неправильные — sshd тихо отказывает в ключевой аутентификации
+# без понятного сообщения об ошибке
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/id_*
+```
+
+**Один SSH-ключ на всё:**
+Один ключ для GitHub, для серверов, для CI. Компрометация одного — компрометация всего. Используйте разные ключи для разных контекстов.
+
+---
+
+## 10. Реальные кейсы с дебагом
+
+### Кейс 1: пользователь не может залогиниться, пароль правильный
+
+```bash
+# Симптом: "Permission denied" хотя пароль точно верный
+
+# Шаг 1: проверить заблокирован ли аккаунт pam_faillock
+faillock --user alice
+# Если много записей — разблокировать
+faillock --user alice --reset
+
+# Шаг 2: проверить не истёк ли аккаунт / пароль
+chage -l alice
+# Account expires: Jan 15, 2024  ← аккаунт истёк!
+
+# Продлить аккаунт
+sudo chage -E -1 alice  # -1 = никогда не истекает
+
+# Шаг 3: проверить не заблокирован ли аккаунт вручную
+passwd -S alice
+# alice L 2024-01-10 0 99999 7 -1  ← L = Locked!
+passwd -u alice  # разблокировать
+```
+
+### Кейс 2: SSH ключ не работает, "Permission denied (publickey)"
+
+```bash
+# Шаг 1: на клиенте — подробный вывод
+ssh -vv alice@server 2>&1 | grep -E "Trying|Offering|debug"
+# Ищем: "Offering public key" → "Server accepts key" или "Server rejects key"
+
+# Шаг 2: на сервере — проверить права
+ls -la ~alice/.ssh/
+# drwxr-xr-x .ssh/  ← НЕПРАВИЛЬНО! должно быть drwx------
+# -rw-r--r-- authorized_keys  ← НЕПРАВИЛЬНО! должно быть -rw-------
+
+# Исправить
+chmod 700 ~alice/.ssh
+chmod 600 ~alice/.ssh/authorized_keys
+chown -R alice:alice ~alice/.ssh
+
+# Шаг 3: проверить что ключ вообще есть
+cat ~alice/.ssh/authorized_keys
+# Должен совпадать с ~/.ssh/id_ed25519.pub на клиенте
+
+# Шаг 4: проверить SELinux (на RHEL)
+ls -laZ ~alice/.ssh/authorized_keys
+restorecon -Rv ~alice/.ssh/
+```
+
+### Кейс 3: ulimits не применяются для сервиса
+
+```bash
+# Симптом: nginx или postgres не открывает много соединений, ошибки "too many open files"
+
+# Проверить текущие лимиты процесса
+cat /proc/$(pgrep -o nginx)/limits | grep "Max open files"
+# Max open files  1024  4096  files  ← слишком мало!
+
+# Для systemd-сервисов — НЕ редактировать limits.conf!
+# Создать override для юнит-файла:
+sudo systemctl edit nginx
+# Добавить:
+# [Service]
+# LimitNOFILE=65536
+
+sudo systemctl daemon-reload
+sudo systemctl restart nginx
+
+# Проверить
+cat /proc/$(pgrep -o nginx)/limits | grep "Max open files"
+# Max open files  65536  65536  files  ✓
+```
+
+---
+
+## 11. Вопросы на собесе
+
+**«Что такое PAM и зачем он нужен?»**
+PAM — это API-прослойка между приложениями и механизмами аутентификации. Приложение вызывает `pam_authenticate()` не зная как именно происходит проверка. PAM позволяет менять схему аутентификации (добавить LDAP, 2FA, биометрию) изменив конфиг без пересборки приложений. Четыре типа: auth, account, password, session.
+
+**«В чём разница between required, requisite и sufficient?»**
+`required` — неудача замечена, но стек продолжается (итог будет FAIL). `requisite` — неудача немедленно прерывает стек, не давая утечь информации через остальные модули. `sufficient` — при успехе немедленно возвращает SUCCESS минуя остальное.
+
+**«Проходит ли SSH ключевая аутентификация через PAM?»**
+Нет, проверка ключа делается sshd напрямую сравнивая с authorized_keys. PAM при ключевой аутентификации вызывается только для account и session (если `UsePAM yes`). Именно поэтому для 2FA с ключами нужно отдельно настраивать `AuthenticationMethods publickey,keyboard-interactive`.
+
+**«Как добавить 2FA в SSH не сломав доступ по ключу?»**
+`AuthenticationMethods publickey,keyboard-interactive` — требует оба фактора. `pam_google_authenticator.so` с флагом `nullok` — пользователи без 2FA могут войти только ключом (переходный период). Всегда оставлять открытую сессию при тестировании изменений PAM.
+
+**«Почему изменения в limits.conf не применяются к nginx?»**
+Потому что systemd-сервисы не проходят через PAM при старте, они не создают "login session". Для systemd нужен `LimitNOFILE` в юнит-файле.
+
+---
+
+## 12. Шпаргалка
+
+```bash
+# PAM — диагностика
+grep -r "pam_" /etc/pam.d/common-auth        # посмотреть стек аутентификации
+pamtester sshd alice authenticate            # протестировать PAM для пользователя
+
+# pam_faillock
+faillock --user alice                        # статус блокировки
+faillock --user alice --reset               # разблокировать
+
+# SSH
+sshd -t                                     # проверить синтаксис sshd_config
+sshd -T | grep permitroot                   # текущие параметры с дефолтами
+ssh -vv user@host                           # подробный дебаг подключения
+ssh-keygen -t ed25519 -C "comment"         # сгенерировать Ed25519 ключ
+ssh-copy-id -i ~/.ssh/id_ed25519.pub user@host  # скопировать ключ
+ssh-keygen -lf ~/.ssh/id_ed25519.pub        # fingerprint ключа
+
+# Права SSH (обязательны!)
+chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys
+
+# 2FA
+google-authenticator                        # настроить TOTP для пользователя
+
+# ulimits
+ulimit -a                                   # текущие лимиты сессии
+ulimit -Hn && ulimit -Sn                   # hard/soft для файлов
+cat /proc/<PID>/limits                      # лимиты конкретного процесса
+
+# Логи аутентификации
+journalctl -u ssh --since "1 hour ago"
+grep "Failed\|Accepted\|Invalid" /var/log/auth.log
+```

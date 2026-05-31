@@ -14,7 +14,7 @@ iam/
 ├── permissions.md              ✅
 ├── authentication.md           ✅
 ├── sssd_ldap_ad.md             ✅
-├── capabilities.md             ⬜ TODO
+├── capabilities.md             ✅
 └── selinux_apparmor.md         ⬜ TODO
 ```
 

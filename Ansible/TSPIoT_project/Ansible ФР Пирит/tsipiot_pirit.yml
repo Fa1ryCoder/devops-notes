@@ -7,16 +7,11 @@
     allowed_pos_versions:
       - "4.6.304-10"
       - "5.304.10"
-    deb_local_dir: "/tmp/packages"
     deb_src_dir: "/opt/tsipiot/packages"
     esm_conf_dest: "/linuxcash/cash/conf/ncash.ini.d/puppet/~esmmanager.ini"
-    crpt_ini_path: "/linuxcash/cash/conf/ncash.ini.d/puppet/crpt.ini"
-
-  handlers:
-    - name: restart comproxy
-      systemd:
-        name: comproxy
-        state: restarted
+    crpt_ini_primary: "/linuxcash/cash/conf/ncash.ini.d/puppet/crpt.ini"
+    crpt_ini_fallback: "/linuxcash/cash/conf/ncash.ini.d/crpt.ini"
+    regime_version: "2.1.0-619"
 
   tasks:
 
@@ -82,41 +77,83 @@
       when: comproxy_version.stdout is version('1.15-62', '<')
 
     # ─────────────────────────────────────────────────────────────
-    # БЛОК 3: Копирование .deb пакетов на кассу
+    # БЛОК 3: Поиск и чтение crpt.ini
     # ─────────────────────────────────────────────────────────────
 
-    - name: Создать директорию для пакетов на кассе
-      file:
-        path: "{{ deb_src_dir }}"
-        state: directory
-        owner: root
-        group: root
-        mode: '0755'
+    - name: Проверить наличие crpt.ini (основной путь)
+      stat:
+        path: "{{ crpt_ini_primary }}"
+      register: crpt_primary_stat
 
-    - name: Скопировать .deb пакеты на кассу
-      copy:
-        src: "{{ deb_local_dir }}/{{ item }}"
-        dest: "{{ deb_src_dir }}/{{ item }}"
-        owner: root
-        group: root
-        mode: '0644'
-      loop:
-        - esm_1.6.2.1_amd64.deb
-        - esm-lm-controller_1.6.2.1_amd64.deb
-        - esm-csi-dkkt.deb
+    - name: Проверить наличие crpt.ini (запасной путь)
+      stat:
+        path: "{{ crpt_ini_fallback }}"
+      register: crpt_fallback_stat
+      when: not crpt_primary_stat.stat.exists
+
+    - name: Определить итоговый путь к crpt.ini
+      set_fact:
+        crpt_ini_path: >-
+          {{ crpt_ini_primary if crpt_primary_stat.stat.exists else
+             crpt_ini_fallback if crpt_fallback_stat.stat is defined and crpt_fallback_stat.stat.exists else
+             '' }}
+
+    - name: Прочитать crpt.ini
+      slurp:
+        src: "{{ crpt_ini_path }}"
+      register: crpt_ini_raw
+      when: crpt_ini_path | length > 0
+
+    - name: Распарсить значения из crpt.ini
+      set_fact:
+        lmchz_url:      "{{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^url\\s*=\\s*(.+)$', '\\1')) | first | trim }}"
+        lmchz_user:     "{{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^user\\s*=\\s*(.+)$', '\\1')) | first | trim }}"
+        lmchz_password: "{{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^password\\s*=\\s*(.+)$', '\\1')) | first | trim }}"
+      when: crpt_ini_path | length > 0
+
+    - name: Вытащить IP из URL
+      set_fact:
+        lmchz_address: "{{ lmchz_url | regex_replace('^https?://([^:/]+)(:\\d+)?.*$', '\\1') }}"
+      when:
+        - lmchz_url is defined
+        - lmchz_url | length > 0
 
     # ─────────────────────────────────────────────────────────────
-    # БЛОК 4: Установка .deb пакетов (порядок важен)
+    # БЛОК 4: Установка пакетов (логика зависит от адреса)
     # ─────────────────────────────────────────────────────────────
 
-    - name: Установить пакеты ТС ПИоТ
-      apt:
-        deb: "{{ item }}"
-      loop:
-        - "{{ deb_src_dir }}/esm_1.6.2.1_amd64.deb"
-        - "{{ deb_src_dir }}/esm-lm-controller_1.6.2.1_amd64.deb"
-        - "{{ deb_src_dir }}/esm-csi-dkkt.deb"
-      notify: restart comproxy
+    # --- Сценарий A: адрес 127.0.0.1 ---
+
+    - name: "[127.0.0.1] Установить esm + esm-lm-controller + esm-csi-dkkt"
+      command: >
+        apt install -y
+        {{ deb_src_dir }}/esm_1.6.2.0_amd64.deb
+        {{ deb_src_dir }}/esm-lm-controller_1.6.2.1_amd64.deb
+        {{ deb_src_dir }}/esm-csi-dkkt_1.0.1_all.deb
+      when: lmchz_address is defined and lmchz_address == '127.0.0.1'
+
+    - name: "[127.0.0.1] Проверить установлен ли regime"
+      set_fact:
+        regime_installed_version: "{{ ansible_facts.packages['regime'][0].version | default('') }}"
+      when: lmchz_address is defined and lmchz_address == '127.0.0.1'
+
+    - name: "[127.0.0.1] Установить/переустановить regime {{ regime_version }}"
+      shell: |
+        echo -e "admin\nadmin\n\n\n" | apt install -y regime={{ regime_version }}
+      when:
+        - lmchz_address is defined and lmchz_address == '127.0.0.1'
+        - regime_installed_version | default('') != regime_version
+
+    # --- Сценарий B: адрес отличный от 127.0.0.1 или crpt.ini нет ---
+
+    - name: "[внешний адрес] Установить esm + esm-csi-dkkt"
+      command: >
+        apt install -y
+        {{ deb_src_dir }}/esm_1.6.2.0_amd64.deb
+        {{ deb_src_dir }}/esm-csi-dkkt_1.0.1_all.deb
+      when: >
+        lmchz_address is not defined or
+        lmchz_address != '127.0.0.1'
 
     # ─────────────────────────────────────────────────────────────
     # БЛОК 5: Сертификаты
@@ -139,41 +176,7 @@
       when: certs_copied.changed
 
     # ─────────────────────────────────────────────────────────────
-    # БЛОК 6: Чтение crpt.ini и парсинг значений
-    # ─────────────────────────────────────────────────────────────
-
-    - name: Проверить наличие crpt.ini
-      stat:
-        path: "{{ crpt_ini_path }}"
-      register: crpt_ini_stat
-
-    - name: Прочитать crpt.ini
-      slurp:
-        src: "{{ crpt_ini_path }}"
-      register: crpt_ini_raw
-      when: crpt_ini_stat.stat.exists
-
-    - name: Распарсить значения из crpt.ini
-      set_fact:
-        lmchz_url: >-
-          {{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^url\s*=\s*(.+)$', '\1')) | default('', true) | trim }}
-        lmchz_user: >-
-          {{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^user\s*=\s*(.+)$', '\1')) | default('', true) | trim }}
-        lmchz_password: >-
-          {{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^password\s*=\s*(.+)$', '\1')) | default('', true) | trim }}
-      when: crpt_ini_stat.stat.exists
-
-    - name: Вытащить IP из URL
-      set_fact:
-        lmchz_address: >-
-          {{ lmchz_url | regex_replace('^https?://([^:/]+)(:\d+)?.*$', '\1') }}
-      when:
-        - crpt_ini_stat.stat.exists
-        - lmchz_url is defined
-        - lmchz_url | length > 0
-
-    # ─────────────────────────────────────────────────────────────
-    # БЛОК 7: Генерация ~esmmanager.ini
+    # БЛОК 6: Генерация ~esmmanager.ini
     # ─────────────────────────────────────────────────────────────
 
     - name: Сгенерировать и положить ~esmmanager.ini
@@ -183,4 +186,12 @@
         owner: root
         group: root
         mode: '0644'
-      notify: restart comproxy
+
+    # ─────────────────────────────────────────────────────────────
+    # БЛОК 7: Перезапуск comproxy
+    # ─────────────────────────────────────────────────────────────
+
+    - name: Перезапустить сервис comproxy
+      systemd:
+        name: comproxy
+        state: restarted

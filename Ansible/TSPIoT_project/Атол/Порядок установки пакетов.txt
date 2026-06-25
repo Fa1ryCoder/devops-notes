@@ -1,0 +1,1 @@
+apt install ./libfptr10_10.10.8.23_amd64.deb ./atol-grpc-service_10.10.8.23_amd64.deb ./esm_1.6.0.0_amd64.deb ./esm-lm-controller_1.6.0.0_amd64.deb

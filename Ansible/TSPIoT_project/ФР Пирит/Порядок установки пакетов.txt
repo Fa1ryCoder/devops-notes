@@ -1,0 +1,1 @@
+apt install ./esm_1.6.2.0_amd64.deb ./esm-lm-controller_1.6.1.0_amd64.deb ./esm-csi-dkkt_1.0.1_all.deb

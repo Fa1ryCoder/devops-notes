@@ -1,0 +1,186 @@
+---
+- name: Установка ТС ПИоТ для ФР Пирит
+  hosts: cashregisters
+  become: yes
+
+  vars:
+    allowed_pos_versions:
+      - "4.6.304-10"
+      - "5.304.10"
+    deb_local_dir: "/tmp/packages"
+    deb_src_dir: "/opt/tsipiot/packages"
+    esm_conf_dest: "/linuxcash/cash/conf/ncash.ini.d/puppet/~esmmanager.ini"
+    crpt_ini_path: "/linuxcash/cash/conf/ncash.ini.d/puppet/crpt.ini"
+
+  handlers:
+    - name: restart comproxy
+      systemd:
+        name: comproxy
+        state: restarted
+
+  tasks:
+
+    # ─────────────────────────────────────────────────────────────
+    # БЛОК 1: Определение типа кассы и проверка версии
+    # ─────────────────────────────────────────────────────────────
+
+    - name: Получить список установленных пакетов
+      package_facts:
+        manager: apt
+
+    - name: Определить тип кассы (РМК)
+      set_fact:
+        cash_type: "rmk"
+        cash_version: "{{ ansible_facts.packages['artix-pos'][0].version }}"
+      when: "'artix-pos' in ansible_facts.packages"
+
+    - name: Определить тип кассы (КСО)
+      set_fact:
+        cash_type: "sco"
+        cash_version: "{{ ansible_facts.packages['artix-sst-sco'][0].version }}"
+      when:
+        - "'artix-sst-sco' in ansible_facts.packages"
+        - cash_type is not defined
+
+    - name: Пропустить кассу — тип не определён
+      block:
+        - debug:
+            msg: "ПРОПУСК {{ inventory_hostname }}: пакет artix-pos/artix-sst-sco не найден"
+        - meta: end_host
+      when: cash_type is not defined
+
+    - name: Пропустить кассу — версия не подходит
+      block:
+        - debug:
+            msg: "ПРОПУСК {{ inventory_hostname }}: версия {{ cash_version }} не входит в список допустимых {{ allowed_pos_versions }}"
+        - meta: end_host
+      when: cash_version not in allowed_pos_versions
+
+    - name: Касса прошла проверку версии
+      debug:
+        msg: "{{ inventory_hostname }}: тип={{ cash_type }}, версия={{ cash_version }} — продолжаем"
+
+    # ─────────────────────────────────────────────────────────────
+    # БЛОК 2: Обновление artix-comproxy
+    # ─────────────────────────────────────────────────────────────
+
+    - name: Обновить artix-comproxy через aptitude
+      command: aptitude install -y artix-comproxy
+      register: comproxy_install
+      changed_when: "'artix-comproxy' in comproxy_install.stdout"
+
+    - name: Получить версию artix-comproxy
+      command: dpkg-query -W -f='${Version}' artix-comproxy
+      register: comproxy_version
+      changed_when: false
+
+    - name: Пропустить кассу — artix-comproxy ниже 1.15-62
+      block:
+        - debug:
+            msg: "ПРОПУСК {{ inventory_hostname }}: artix-comproxy версии {{ comproxy_version.stdout }} ниже требуемой 1.15-62"
+        - meta: end_host
+      when: comproxy_version.stdout is version('1.15-62', '<')
+
+    # ─────────────────────────────────────────────────────────────
+    # БЛОК 3: Копирование .deb пакетов на кассу
+    # ─────────────────────────────────────────────────────────────
+
+    - name: Создать директорию для пакетов на кассе
+      file:
+        path: "{{ deb_src_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Скопировать .deb пакеты на кассу
+      copy:
+        src: "{{ deb_local_dir }}/{{ item }}"
+        dest: "{{ deb_src_dir }}/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop:
+        - esm_1.6.2.1_amd64.deb
+        - esm-lm-controller_1.6.2.1_amd64.deb
+        - esm-csi-dkkt.deb
+
+    # ─────────────────────────────────────────────────────────────
+    # БЛОК 4: Установка .deb пакетов (порядок важен)
+    # ─────────────────────────────────────────────────────────────
+
+    - name: Установить пакеты ТС ПИоТ
+      apt:
+        deb: "{{ item }}"
+      loop:
+        - "{{ deb_src_dir }}/esm_1.6.2.1_amd64.deb"
+        - "{{ deb_src_dir }}/esm-lm-controller_1.6.2.1_amd64.deb"
+        - "{{ deb_src_dir }}/esm-csi-dkkt.deb"
+      notify: restart comproxy
+
+    # ─────────────────────────────────────────────────────────────
+    # БЛОК 5: Сертификаты
+    # ─────────────────────────────────────────────────────────────
+
+    - name: Скопировать сертификаты в ca-certificates
+      copy:
+        remote_src: yes
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+      loop:
+        - { src: "/etc/esp/esm/um/ca.crt",      dest: "/usr/local/share/ca-certificates/esm.crt" }
+        - { src: "/etc/esp/esm/um/esp.crt",      dest: "/usr/local/share/ca-certificates/esp.crt" }
+        - { src: "/etc/esp/esm/um/gismt.crt",    dest: "/usr/local/share/ca-certificates/gismt.crt" }
+        - { src: "/etc/esp/lmcontroller/ca.crt", dest: "/usr/local/share/ca-certificates/esm-lm.crt" }
+      register: certs_copied
+
+    - name: Обновить хранилище сертификатов
+      command: update-ca-certificates
+      when: certs_copied.changed
+
+    # ─────────────────────────────────────────────────────────────
+    # БЛОК 6: Чтение crpt.ini и парсинг значений
+    # ─────────────────────────────────────────────────────────────
+
+    - name: Проверить наличие crpt.ini
+      stat:
+        path: "{{ crpt_ini_path }}"
+      register: crpt_ini_stat
+
+    - name: Прочитать crpt.ini
+      slurp:
+        src: "{{ crpt_ini_path }}"
+      register: crpt_ini_raw
+      when: crpt_ini_stat.stat.exists
+
+    - name: Распарсить значения из crpt.ini
+      set_fact:
+        lmchz_url: >-
+          {{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^url\s*=\s*(.+)$', '\1')) | default('', true) | trim }}
+        lmchz_user: >-
+          {{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^user\s*=\s*(.+)$', '\1')) | default('', true) | trim }}
+        lmchz_password: >-
+          {{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^password\s*=\s*(.+)$', '\1')) | default('', true) | trim }}
+      when: crpt_ini_stat.stat.exists
+
+    - name: Вытащить IP из URL
+      set_fact:
+        lmchz_address: >-
+          {{ lmchz_url | regex_replace('^https?://([^:/]+)(:\d+)?.*$', '\1') }}
+      when:
+        - crpt_ini_stat.stat.exists
+        - lmchz_url is defined
+        - lmchz_url | length > 0
+
+    # ─────────────────────────────────────────────────────────────
+    # БЛОК 7: Генерация ~esmmanager.ini
+    # ─────────────────────────────────────────────────────────────
+
+    - name: Сгенерировать и положить ~esmmanager.ini
+      template:
+        src: esmmanager.ini.j2
+        dest: "{{ esm_conf_dest }}"
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart comproxy

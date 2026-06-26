@@ -1,0 +1,17 @@
+---
+# Установка TSPiot на фр Штрих
+- name: Установка TSPiot на фр Штрих
+  host: all_nodes
+  becomes: true
+
+  vars:
+    os_realese: 
+    - '4.6.304-10'
+    - '5.6.304.10'
+    regime: "2.1.0-619"
+    packages: "/opt/tsipiot/packages"
+    crpt_ini_puppet: "/linuxcash/cash/conf/ncash.ini.d/puppet/crpt.ini"
+    crpt_ini_default: "/linuxcash/cash/conf/ncash.ini.d/crpt.ini"
+
+  tasks:
+    - name:

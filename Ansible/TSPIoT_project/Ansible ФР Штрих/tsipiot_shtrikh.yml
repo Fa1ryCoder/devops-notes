@@ -168,6 +168,11 @@
 
     # --- Сценарий A: адрес 127.0.0.1 ---
 
+    - name: "[127.0.0.1] Установить/обновить regime"
+      shell: |
+        echo -e "admin\nadmin\n\n\n" | apt install -y regime
+      when: lmchz_address is defined and lmchz_address == '127.0.0.1'
+
     - name: "[127.0.0.1] Найти deb-пакет esm-lm-controller"
       find:
         paths: "{{ deb_src_dir }}"
@@ -180,15 +185,6 @@
       when:
         - lmchz_address is defined and lmchz_address == '127.0.0.1'
         - esm_lm_deb.files | length > 0
-
-    # --- Сценарий B: адрес отличный от 127.0.0.1 или crpt.ini нет ---
-
-    - name: "[внешний адрес] esm-lm-controller не устанавливается"
-      debug:
-        msg: "{{ inventory_hostname }}: внешний адрес — esm-lm-controller не требуется"
-      when: >
-        lmchz_address is not defined or
-        lmchz_address != '127.0.0.1'
 
     # ─────────────────────────────────────────────────────────────
     # БЛОК 5: Сертификаты

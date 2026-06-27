@@ -1,6 +1,6 @@
 ---
 - name: Установка ТС ПИоТ для ФР Штрих
-  hosts: cashregisters
+  hosts: all_nodes
   become: yes
 
   vars:

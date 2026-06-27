@@ -1,0 +1,192 @@
+---
+- name: Установка ТС ПИоТ для ФР Штрих
+  hosts: cashregisters
+  become: yes
+
+  vars:
+    min_pos_version_4x: "4.6.304-10"
+    min_pos_version_5x: "5.304.10"
+    deb_src_dir: "/opt/tsipiot/packages"
+    esm_conf_dest: "/linuxcash/cash/conf/ncash.ini.d/puppet/~esmmanager.ini"
+    crpt_ini_primary: "/linuxcash/cash/conf/ncash.ini.d/puppet/crpt.ini"
+    crpt_ini_fallback: "/linuxcash/cash/conf/ncash.ini.d/crpt.ini"
+    fr_drv_lib_dir: "/usr/lib/fr_drv_ng"
+
+  tasks:
+
+    # ─────────────────────────────────────────────────────────────
+    # БЛОК 1: Определение типа кассы и проверка версии
+    # ─────────────────────────────────────────────────────────────
+
+    - name: Получить список установленных пакетов
+      package_facts:
+        manager: apt
+
+    - name: Определить тип кассы (РМК)
+      set_fact:
+        cash_type: "rmk"
+        cash_version: "{{ ansible_facts.packages['artix-pos'][0].version }}"
+      when: "'artix-pos' in ansible_facts.packages"
+
+    - name: Определить тип кассы (КСО)
+      set_fact:
+        cash_type: "sco"
+        cash_version: "{{ ansible_facts.packages['artix-sst-sco'][0].version }}"
+      when:
+        - "'artix-sst-sco' in ansible_facts.packages"
+        - cash_type is not defined
+
+    - name: Пропустить кассу — тип не определён
+      block:
+        - debug:
+            msg: "ПРОПУСК {{ inventory_hostname }}: пакет artix-pos/artix-sst-sco не найден"
+        - meta: end_host
+      when: cash_type is not defined
+
+    - name: Пропустить кассу — версия ветки 4.x ниже минимальной
+      block:
+        - debug:
+            msg: "ПРОПУСК {{ inventory_hostname }}: версия {{ cash_version }} ниже минимально допустимой {{ min_pos_version_4x }}"
+        - meta: end_host
+      when:
+        - cash_version.startswith('4.')
+        - cash_version is version(min_pos_version_4x, '<')
+
+    - name: Пропустить кассу — версия ветки 5.x ниже минимальной
+      block:
+        - debug:
+            msg: "ПРОПУСК {{ inventory_hostname }}: версия {{ cash_version }} ниже минимально допустимой {{ min_pos_version_5x }}"
+        - meta: end_host
+      when:
+        - cash_version.startswith('5.')
+        - cash_version is version(min_pos_version_5x, '<')
+
+    - name: Касса прошла проверку версии
+      debug:
+        msg: "{{ inventory_hostname }}: тип={{ cash_type }}, версия={{ cash_version }} — продолжаем"
+
+    # ─────────────────────────────────────────────────────────────
+    # БЛОК 2: Установка libfrdrvng-wrapper и копирование библиотек
+    # ─────────────────────────────────────────────────────────────
+
+    - name: Установить libfrdrvng-wrapper через aptitude
+      command: aptitude install -y libfrdrvng-wrapper
+      register: libfrdrvng_install
+      changed_when: "'libfrdrvng-wrapper' in libfrdrvng_install.stdout"
+
+    - name: Создать директорию /usr/lib/fr_drv_ng если не существует
+      file:
+        path: "{{ fr_drv_lib_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Скопировать библиотеки драйвера в /usr/lib/fr_drv_ng/
+      copy:
+        remote_src: yes
+        src: "{{ item }}"
+        dest: "{{ fr_drv_lib_dir }}/"
+        owner: root
+        group: root
+        mode: '0644'
+      loop:
+        - "{{ deb_src_dir }}/libclassic_fr_drv_ng.so"
+        - "{{ deb_src_dir }}/libmp_ts_piot.so"
+
+    # ─────────────────────────────────────────────────────────────
+    # БЛОК 3: Поиск и чтение crpt.ini
+    # ─────────────────────────────────────────────────────────────
+
+    - name: Проверить наличие crpt.ini (основной путь)
+      stat:
+        path: "{{ crpt_ini_primary }}"
+      register: crpt_primary_stat
+
+    - name: Проверить наличие crpt.ini (запасной путь)
+      stat:
+        path: "{{ crpt_ini_fallback }}"
+      register: crpt_fallback_stat
+      when: not crpt_primary_stat.stat.exists
+
+    - name: Определить итоговый путь к crpt.ini
+      set_fact:
+        crpt_ini_path: >-
+          {{ crpt_ini_primary if crpt_primary_stat.stat.exists else
+             crpt_ini_fallback if crpt_fallback_stat.stat is defined and crpt_fallback_stat.stat.exists else
+             '' }}
+
+    - name: Прочитать crpt.ini
+      slurp:
+        src: "{{ crpt_ini_path }}"
+      register: crpt_ini_raw
+      when: crpt_ini_path | length > 0
+
+    - name: Распарсить значения из crpt.ini
+      set_fact:
+        lmchz_url:      "{{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^url\\s*=\\s*(.+)$', '\\1')) | first | trim }}"
+        lmchz_user:     "{{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^user\\s*=\\s*(.+)$', '\\1')) | first | trim }}"
+        lmchz_password: "{{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^password\\s*=\\s*(.+)$', '\\1')) | first | trim }}"
+      when: crpt_ini_path | length > 0
+
+    - name: Вытащить IP из URL
+      set_fact:
+        lmchz_address: "{{ lmchz_url | regex_replace('^https?://([^:/]+)(:\\d+)?.*$', '\\1') }}"
+      when:
+        - lmchz_url is defined
+        - lmchz_url | length > 0
+
+    # ─────────────────────────────────────────────────────────────
+    # БЛОК 4: Установка пакетов (логика зависит от адреса)
+    # ─────────────────────────────────────────────────────────────
+
+    # --- Сценарий A: адрес 127.0.0.1 ---
+
+    - name: "[127.0.0.1] Установить esm + esm-lm-controller"
+      command: >
+        apt install -y
+        {{ deb_src_dir }}/esm_1.6.2.0_amd64.deb
+        {{ deb_src_dir }}/esm-lm-controller_1.6.2.1_amd64.deb
+      when: lmchz_address is defined and lmchz_address == '127.0.0.1'
+
+    # --- Сценарий B: адрес отличный от 127.0.0.1 или crpt.ini нет ---
+
+    - name: "[внешний адрес] Установить esm"
+      command: >
+        apt install -y
+        {{ deb_src_dir }}/esm_1.6.2.0_amd64.deb
+      when: >
+        lmchz_address is not defined or
+        lmchz_address != '127.0.0.1'
+
+    # ─────────────────────────────────────────────────────────────
+    # БЛОК 5: Сертификаты
+    # ─────────────────────────────────────────────────────────────
+
+    - name: Скопировать сертификаты в ca-certificates
+      copy:
+        remote_src: yes
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+      loop:
+        - { src: "/etc/esp/esm/um/ca.crt",      dest: "/usr/local/share/ca-certificates/esm.crt" }
+        - { src: "/etc/esp/esm/um/esp.crt",      dest: "/usr/local/share/ca-certificates/esp.crt" }
+        - { src: "/etc/esp/esm/um/gismt.crt",    dest: "/usr/local/share/ca-certificates/gismt.crt" }
+        - { src: "/etc/esp/lmcontroller/ca.crt", dest: "/usr/local/share/ca-certificates/esm-lm.crt" }
+      register: certs_copied
+
+    - name: Обновить хранилище сертификатов
+      command: update-ca-certificates
+      when: certs_copied.changed
+
+    # ─────────────────────────────────────────────────────────────
+    # БЛОК 6: Генерация ~esmmanager.ini
+    # ─────────────────────────────────────────────────────────────
+
+    - name: Сгенерировать и положить ~esmmanager.ini
+      template:
+        src: esmmanager.ini.j2
+        dest: "{{ esm_conf_dest }}"
+        owner: root
+        group: root
+        mode: '0644'

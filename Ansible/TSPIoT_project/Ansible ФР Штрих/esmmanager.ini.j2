@@ -1,0 +1,36 @@
+[plugins]
+esmservice = on
+
+[esm]
+orchestratorTimeout = 30
+
+[markedgoods]
+enableMarkVerifyCrpt = true
+markVerifyCrptService = esm
+
+[draftbeer]
+enableMarkVerifyCrpt = true
+markVerifyCrptService = esm
+
+[motp]
+enableMarkVerifyCrpt = true
+markVerifyCrptService = esm
+
+[moot]
+enableMarkVerifyCrpt = true
+markVerifyCrptService = esm
+
+[metromarking]
+enableMarkVerifyCrpt = true
+markVerifyCrptService = esm
+
+[metrotobacco]
+enableMarkVerifyCrpt = true
+markVerifyCrptService = esm
+
+{% if lmchz_address is defined %}
+[ESM.LMCHZ]
+address = {{ lmchz_address }}
+login = {{ lmchz_user }}
+password = {{ lmchz_password }}
+{% endif %}

@@ -1,6 +1,6 @@
 ---
 - name: Установка ТС ПИоТ для ФР Штрих
-  hosts: all_nodes
+  hosts: cashregisters
   become: yes
 
   vars:
@@ -170,7 +170,12 @@
 
     - name: "[127.0.0.1] Установить/обновить regime"
       shell: |
-        echo -e "admin\nadmin\n\n\n" | apt install -y regime
+        apt install -y regime <<EOF
+        admin
+        admin
+
+
+        EOF
       when: lmchz_address is defined and lmchz_address == '127.0.0.1'
 
     - name: "[127.0.0.1] Найти deb-пакет esm-lm-controller"

@@ -66,15 +66,31 @@
         msg: "{{ inventory_hostname }}: тип={{ cash_type }}, версия={{ cash_version }} — продолжаем"
 
     # ─────────────────────────────────────────────────────────────
-    # БЛОК 2: Установка libfrdrvng-wrapper и копирование библиотек
+    # БЛОК 2: Доставка файлов и установка libfrdrvng-wrapper
     # ─────────────────────────────────────────────────────────────
+
+    - name: Создать директорию {{ deb_src_dir }} на хосте если не существует
+      file:
+        path: "{{ deb_src_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Скопировать пакеты с управляющей машины на хост
+      copy:
+        src: "{{ deb_src_dir }}/"
+        dest: "{{ deb_src_dir }}/"
+        owner: root
+        group: root
+        mode: '0644'
 
     - name: Установить libfrdrvng-wrapper через aptitude
       command: aptitude install -y libfrdrvng-wrapper
       register: libfrdrvng_install
       changed_when: "'libfrdrvng-wrapper' in libfrdrvng_install.stdout"
 
-    - name: Создать директорию /usr/lib/fr_drv_ng если не существует
+    - name: Создать директорию {{ fr_drv_lib_dir }} если не существует
       file:
         path: "{{ fr_drv_lib_dir }}"
         state: directory
@@ -82,7 +98,7 @@
         group: root
         mode: '0755'
 
-    - name: Скопировать библиотеки драйвера в /usr/lib/fr_drv_ng/
+    - name: Скопировать библиотеки драйвера в {{ fr_drv_lib_dir }}
       copy:
         remote_src: yes
         src: "{{ item }}"
@@ -93,6 +109,16 @@
       loop:
         - "{{ deb_src_dir }}/libclassic_fr_drv_ng.so"
         - "{{ deb_src_dir }}/libmp_ts_piot.so"
+
+    - name: Найти deb-пакет esm
+      find:
+        paths: "{{ deb_src_dir }}"
+        patterns: "esm_*.deb"
+      register: esm_deb
+
+    - name: Установить esm
+      command: apt install -y {{ esm_deb.files[0].path }}
+      when: esm_deb.files | length > 0
 
     # ─────────────────────────────────────────────────────────────
     # БЛОК 3: Поиск и чтение crpt.ini
@@ -142,19 +168,24 @@
 
     # --- Сценарий A: адрес 127.0.0.1 ---
 
-    - name: "[127.0.0.1] Установить esm + esm-lm-controller"
-      command: >
-        apt install -y
-        {{ deb_src_dir }}/esm_1.6.2.0_amd64.deb
-        {{ deb_src_dir }}/esm-lm-controller_1.6.2.1_amd64.deb
+    - name: "[127.0.0.1] Найти deb-пакет esm-lm-controller"
+      find:
+        paths: "{{ deb_src_dir }}"
+        patterns: "esm-lm-controller_*.deb"
+      register: esm_lm_deb
       when: lmchz_address is defined and lmchz_address == '127.0.0.1'
+
+    - name: "[127.0.0.1] Установить esm-lm-controller"
+      command: apt install -y {{ esm_lm_deb.files[0].path }}
+      when:
+        - lmchz_address is defined and lmchz_address == '127.0.0.1'
+        - esm_lm_deb.files | length > 0
 
     # --- Сценарий B: адрес отличный от 127.0.0.1 или crpt.ini нет ---
 
-    - name: "[внешний адрес] Установить esm"
-      command: >
-        apt install -y
-        {{ deb_src_dir }}/esm_1.6.2.0_amd64.deb
+    - name: "[внешний адрес] esm-lm-controller не устанавливается"
+      debug:
+        msg: "{{ inventory_hostname }}: внешний адрес — esm-lm-controller не требуется"
       when: >
         lmchz_address is not defined or
         lmchz_address != '127.0.0.1'

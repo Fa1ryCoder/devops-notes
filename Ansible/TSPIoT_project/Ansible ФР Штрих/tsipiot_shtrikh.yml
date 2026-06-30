@@ -110,6 +110,27 @@
         - "{{ deb_src_dir }}/libclassic_fr_drv_ng.so"
         - "{{ deb_src_dir }}/libmp_ts_piot.so"
 
+    - name: Проверить наличие hw.ini
+      stat:
+        path: "/linuxcash/cash/conf/drivers/hw.ini"
+      register: hw_ini_stat
+
+    - name: Заменить секцию ShtrihM на PosCenter в hw.ini (если transport=tcp)
+      command: python3 {{ deb_src_dir }}/replace_shtrikh_section.py
+      register: hw_ini_replace
+      changed_when: "'CHANGED' in hw_ini_replace.stdout"
+      when: hw_ini_stat.stat.exists
+
+    - name: Результат замены секции в hw.ini
+      debug:
+        msg: "{{ inventory_hostname }}: {{ hw_ini_replace.stdout }}"
+      when: hw_ini_stat.stat.exists
+
+    - name: hw.ini не найден — пропускаем шаг
+      debug:
+        msg: "{{ inventory_hostname }}: hw.ini не найден по пути /linuxcash/cash/conf/drivers/hw.ini, пропускаем замену секции"
+      when: not hw_ini_stat.stat.exists
+
     - name: Найти deb-пакет esm
       find:
         paths: "{{ deb_src_dir }}"

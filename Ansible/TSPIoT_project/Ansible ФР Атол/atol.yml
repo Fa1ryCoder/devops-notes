@@ -1,0 +1,64 @@
+---
+- name: Установка tspiot под ФР Атол
+  hosts: all_nodes
+  become: true
+  vars:
+    min_version4: "4.6.304-10"
+    min_version5: "5.304.10"
+    path_on_nodes: "/home/tspiot/packages"
+    path_on_control_node: "/opt/tspiot/packages"
+    esm_config_file: "/linuxcash/cash/conf/ncash.ini.d/puppet/~esmmanager.ini"
+
+
+  ################################      
+  ## БЛОК №1 ОПРЕДЕЛЕНИЕ ВЕРСИИ ##
+  ################################
+
+  tasks:
+    - name: Получение списка пакетов
+      ansible.builtin.package_facts:
+        manager: apt
+
+    - name: Проверка пакета 'artix-pos'
+      ansible.builtin.set_fact:
+        node_version: "{{ ansible_facts.packages['artix-pos'][0].version }}"
+      when: "'artix-pos' in ansible_facts.packages"
+
+    - name: Проверка пакета 'artix-sst-sco'
+      ansible.builtin.set_fact:
+        node_version: "{{ ansible_facts.packages['artix-sst-sco'][0].version }}"
+      when: "'artix-sst-sco' in ansible_facts.packages"
+
+    - name: Проверяем установлен ли ПО Артикс на ноде 
+      block:
+        - ansible.builtin.debug:
+            msg: "На ноде: {{ inventory_hostname }} не установлен artix-pos/artix-sst. Пропускаем.."
+        
+        - ansible.builtin.meta: end_host 
+      when: node_version is not defined
+
+
+    - name: Стоп - версия ниже минимальной ветки 5
+      block:
+        - ansible.builtin.debug:
+            msg: "У хоста: {{ inventory_hostname }} версия {{ node_version }} ниже минимальной {{ min_version5 }}"
+
+        - ansible.builtin.meta: end_host
+      when:
+        - node_version.split('.') | first == '5'
+        - node_version is version(min_version5, '<')
+            
+
+    - name: Стоп - версия ниже минимальной ветки 4
+      block:
+        - ansible.builtin.debug:
+            msg: "У хоста: {{ inventory_hostname }} версия {{ node_version }} ниже минимальной {{ min_version4 }}"
+        
+        - ansible.builtin.meta: end_host
+      when:
+        - node_version.split('.') | first == '4'
+        - node_version is version(min_version4, '<')
+
+    - name: Debug
+      ansible.builtin.debug:
+        msg: "{{ node_version }}"

@@ -3,6 +3,11 @@
   hosts: all_nodes
   become: true
   vars:
+    deb_packages:
+      - libfptr10_10.10.8.24_amd64.deb
+      - atol-grpc-service_10.10.8.24_amd64.deb
+      - esm_1.6.2.1_amd64.deb
+      - esm-lm-controller_1.6.2.1_amd64.deb
     min_version4: "4.6.304-10"
     min_version5: "5.304.10"
     path_on_nodes: "/home/tspiot/packages"
@@ -10,11 +15,13 @@
     esm_config_file: "/linuxcash/cash/conf/ncash.ini.d/puppet/~esmmanager.ini"
 
 
-  ################################      
-  ## БЛОК №1 ОПРЕДЕЛЕНИЕ ВЕРСИИ ##
-  ################################
 
   tasks:
+        
+      ################################      
+      ## БЛОК №1 ОПРЕДЕЛЕНИЕ ВЕРСИИ ##
+      ################################
+
     - name: Получение списка пакетов
       ansible.builtin.package_facts:
         manager: apt
@@ -62,3 +69,23 @@
     - name: Debug
       ansible.builtin.debug:
         msg: "{{ node_version }}"
+
+      #################################     
+      ## БЛОК №2 Перемещение пакетов ##
+      #################################
+    
+    - name: Создать директорию для deb пакетов
+      ansible.builtin.file:
+        path: "{{ path_on_nodes }}"
+        state: directory
+    
+    - name: Доставка .deb пакетов на хост
+      ansible.builtin.copy:
+        src: "{{ path_on_control_node }}/{{ item }}"
+        dest: "{{ path_on_nodes }}/{{ item }}"
+      loop: "{{ deb_packages }}"
+
+      ###########################################
+      ## БЛОК №3 Установка необходимых пакетов ##
+      ###########################################
+      

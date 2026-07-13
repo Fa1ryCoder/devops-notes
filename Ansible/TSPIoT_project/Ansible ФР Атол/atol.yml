@@ -13,6 +13,8 @@
     path_on_nodes: "/home/tspiot/packages"
     path_on_control_node: "/opt/tspiot/packages"
     esm_config_file: "/linuxcash/cash/conf/ncash.ini.d/puppet/~esmmanager.ini"
+    crpt_primary: "/linuxcash/cash/conf/ncash.ini.d/puppet/crpt.ini"
+    crpt_secondary: "/linuxcash/cash/conf/ncash.ini.d/crpt.ini"
 
 
 
@@ -88,4 +90,68 @@
       ###########################################
       ## БЛОК №3 Установка необходимых пакетов ##
       ###########################################
-      
+
+    - name: Установка libfptr10, atol-grpc-service, esm (с помощью apt)
+      ansible.builtin.command:
+        argv:
+          - apt-get
+          - install
+          - -y
+          - "{{ path_on_nodes }}/libfptr10_10.10.8.24_amd64.deb"
+          - "{{ path_on_nodes }}/atol-grpc-service_10.10.8.24_amd64.deb"
+          - "{{ path_on_nodes }}/esm_1.6.2.1_amd64.deb"
+      when: "'libfptr10' not in ansible_facts.packages"
+
+      #############################################################
+      ## Блок №4 Определение файла crpt.ini и парсинг параметров ##
+      #############################################################
+
+    - name: Ищем crpt.ini в /linuxcash/cash/conf/ncash.ini.d/puppet
+      ansible.builtin.stat:
+        path: "{{ crpt_primary }}"
+      register: puppet_crpt_stat
+
+    - name: Ищем crpt.ini в /linuxcash/cash/conf/ncash.ini.d
+      ansible.builtin.stat:
+        path: "{{ crpt_secondary }}"
+      register: secondary_crpt_stat
+      when: not puppet_crpt_stat.stat.exists
+    
+    - name: Ищем итоговый путь crpt.ini
+      ansible.builtin.set_fact:
+        general_path_crpt_ini: >-
+          {{ 
+          crpt_primary 
+          if puppet_crpt_stat.stat.exists
+          else crpt_secondary
+          if secondary_crpt_stat.stat is defined and secondary_crpt_stat.stat.exists
+          else ''
+          }}
+    
+    - name: Чтение crpt.ini
+      ansible.builtin.slurp:
+        src: "{{ general_path_crpt_ini }}"
+      register: crpt_ini_raw
+      when: general_path_crpt_ini | length > 0
+
+    - name: Извлечение параметров ЛМЧЗ
+      ansible.builtin.set_fact:
+        lmchz_url: "{{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^url\\s*=\\s*(.+)$', '\\1')) | first | trim }}"
+        lmchz_user: "{{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^user\\s*=\\s*(.+)$', '\\1')) | first | trim }}"
+        lmchz_password: "{{ (crpt_ini_raw.content | b64decode | regex_search('(?m)^password\\s*=\\s*(.+)$', '\\1')) | first | trim }}"
+      when: general_path_crpt_ini | length > 0
+    
+    - name: Вытащить IP из URL
+      ansible.builtin.set_fact:
+        lmchz_address: "{{ lmchz_url | regex_replace('^https?://([^:/]+)(:\\d+)?.*$', '\\1') }}"
+      when:
+        - lmchz_url is defined
+        - lmchz_url | length > 0
+    
+    - name: Debug
+      ansible.builtin.debug:
+        msg: "URL: {{ lmchz_url }}, USER: {{ lmchz_user }}, PASS: {{ lmchz_password }}, ADDRESS: {{ lmchz_address }}"
+
+    #####################################
+    ## Блок №5 Установка пакета esm-lm ##
+    #####################################

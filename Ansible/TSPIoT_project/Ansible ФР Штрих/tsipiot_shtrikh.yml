@@ -112,7 +112,7 @@
 
     - name: Проверить наличие hw.ini
       stat:
-        path: "/linuxcash/cash/conf/drivers/hw.ini"
+        path: /linuxcash/cash/conf/drivers/hw.ini
       register: hw_ini_stat
 
     - name: Заменить секцию ShtrihM на PosCenter в hw.ini (если transport=tcp)

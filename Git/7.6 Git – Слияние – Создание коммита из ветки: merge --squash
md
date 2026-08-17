@@ -1,0 +1,149 @@
+# 7.6 Git – Слияние – Создание коммита из ветки: merge --squash
+
+Команда `git merge --squash <ветка>` вычисляет результат слияния тем же способом, что и обычный `git merge`: ищет общего предка, сравнивает изменения с обеих сторон и точно так же обнаруживает конфликты. Отличие проявляется в конце: вместо коммита слияния Git помещает весь получившийся результат в индекс текущей ветки одним блоком, а сам коммит не создаёт. HEAD текущей ветки остаётся на прежнем месте, пока пользователь не выполнит `git commit` вручную.
+
+## Слияние трёх коммитов в один
+
+Пусть ветка `feature` содержит три коммита поверх `master`:
+
+```
+$ git log --oneline --graph --decorate master feature
+* 7d8715f (feature) fix typo in log message
+* e6ddf26 add logging
+* c93124e add input validation
+* 66c15db (HEAD -> master) начальный коммит
+```
+
+Слияние запускается так:
+
+```
+$ git merge --squash feature
+Updating 66c15db..7d8715f
+Fast-forward
+Squash commit -- not updating HEAD
+ app.py | 3 +++
+ 1 file changed, 3 insertions(+)
+```
+
+Строка `Fast-forward` в выводе относится к тому, как Git вычислил изменения, а не к тому, что произошло с master: ветка feature была строго впереди, и без `--squash` слияние обошлось бы простым переносом указателя. При `--squash` указатель не двигается — обновляется только индекс:
+
+```
+$ git status
+On branch master
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	modified:   app.py
+```
+
+В индекс попали изменения всех трёх коммитов feature, объединённые в одну правку; какой была история между ними, отсюда уже не видно. Одновременно Git создаёт файл `.git/SQUASH_MSG` с заготовкой сообщения для будущего коммита:
+
+```
+$ cat .git/SQUASH_MSG
+Squashed commit of the following:
+
+commit 7d8715fc7d27e10efa894633deb42942d950695f
+Author: Ivan Ivanov <ivan@example.com>
+Date:   Sun Aug 16 21:22:41 2026 +0000
+
+    fix typo in log message
+
+commit e6ddf26c3142f73868b1f7ecdfac2c98b4bc068e
+Author: Ivan Ivanov <ivan@example.com>
+Date:   Sun Aug 16 21:22:41 2026 +0000
+
+    add logging
+
+commit c93124eb53f9eedccd2f091a10685d8e9033a001
+Author: Ivan Ivanov <ivan@example.com>
+Date:   Sun Aug 16 21:22:41 2026 +0000
+
+    add input validation
+```
+
+Если запустить `git commit` без `-m`, в редакторе откроется именно этот текст — его можно сократить до одной строки, отредактировать или оставить как есть. Флаг `--no-edit` принимает заготовку без открытия редактора, а `-m "сообщение"` заменяет её полностью. Получить коммит сразу за один шаг, без промежуточной остановки на индексе, нельзя — Git прямо запрещает сочетание `--squash` и `--commit`:
+
+```
+$ git merge --squash --commit feature
+fatal: options '--squash' and '--commit.' cannot be used together
+```
+
+После обычного `git commit` на master появляется новый коммит:
+
+```
+$ git commit -m "add input validation and logging"
+$ git log --oneline --graph --decorate master feature
+* fc01f12 (HEAD -> master) add input validation and logging
+| * 7d8715f (feature) fix typo in log message
+| * e6ddf26 add logging
+| * c93124e add input validation
+|/
+* 66c15db начальный коммит
+```
+
+У этого коммита ровно один родитель — тот, что был на master до слияния:
+
+```
+$ git log -1 --format="parents: %P" HEAD
+parents: 66c15dbad33b7c3a23067cb4f1014b765f523ac6
+```
+
+При обычном слиянии здесь были бы два родителя, и второй указывал бы на кончик feature. Здесь такой связи нет: для Git новый коммит ничем не отличается от коммита, сделанного вручную поверх тех же файлов.
+
+## Ветка feature не считается слитой
+
+`git branch --merged` проверяет, является ли кончик ветки предком текущего HEAD. У feature такого предка нет, поэтому в список она не попадает:
+
+```
+$ git branch --merged
+* master
+```
+
+По той же причине обычное удаление ветки отказывает:
+
+```
+$ git branch -d feature
+error: the branch 'feature' is not fully merged.
+If you are sure you want to delete it, run 'git branch -D feature'
+```
+
+Код из feature уже целиком находится в master, так что принудительное удаление ничего не теряет — пропадает только возможность обратиться к трём исходным коммитам по имени ветки. Сами коммиты никуда не исчезают: они остаются в репозитории, доступны через reflog и удаляются только сборкой мусора. Для удаления нужен флаг `-D`:
+
+```
+$ git branch -D feature
+Deleted branch feature (was 7d8715f).
+```
+
+## Отмена squash-слияния при конфликте
+
+Если изменения из другой ветки — например, hotfix — конфликтуют с текущим состоянием master, `merge --squash` останавливается так же, как обычное слияние: конфликтующие файлы помечаются как unmerged:
+
+```
+$ git merge --squash hotfix
+Auto-merging app.py
+CONFLICT (content): Merge conflict in app.py
+Squash commit -- not updating HEAD
+Automatic merge failed; fix conflicts and then commit the result.
+
+$ git status
+On branch master
+Unmerged paths:
+  (use "git restore --staged <file>..." to unstage)
+  (use "git add <file>..." to mark resolution)
+	both modified:   app.py
+```
+
+Разрешаются такие конфликты обычным способом: вручную отредактировать файл и выполнить `git add`. Разница появляется, если слияние нужно отменить целиком. Обычное слияние во время конфликта хранит файл `MERGE_HEAD` — по его наличию Git понимает, что слияние не завершено, и именно этот файл использует `git merge --abort`, чтобы решить, куда откатываться. Squash-слияние `MERGE_HEAD` не создаёт никогда, даже при конфликте, поэтому `--abort` для него не срабатывает:
+
+```
+$ git merge --abort
+fatal: There is no merge to abort (MERGE_HEAD missing).
+```
+
+Отменить незавершённое squash-слияние можно командой `git reset --hard` — она возвращает индекс и рабочий каталог к последнему коммиту и заодно убирает файл `SQUASH_MSG`:
+
+```
+$ git reset --hard
+HEAD is now at 55c0f88 master: поправить сообщение лога
+```
+
+На GitHub и GitLab та же идея встроена в интерфейс pull request / merge request: кнопка «Squash and merge» на GitHub и чекбокс «Squash commits» на GitLab дают тот же результат — один коммит в целевой ветке, без коммита слияния и без связи с исходными мелкими коммитами.
